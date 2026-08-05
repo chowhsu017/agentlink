@@ -571,17 +571,21 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
 
     @app.websocket("/agentlink/ws")
     async def handle_ws(websocket: WebSocket):
-        """WebSocket 连接——校验 session_id 防止会话劫持"""
+        """WebSocket 连接——强制校验 session_id 防止会话劫持"""
         # 读取连接时附带的查询参数: ws://host/agentlink/ws?session_id=xxx&did=xxx
         qs_session = websocket.query_params.get("session_id", "")
         qs_did = websocket.query_params.get("did", "")
 
-        # 校验 session_id 匹配当前会话
+        # 必须提供 session_id 且匹配当前会话
         if not node.session_id:
             await websocket.close(code=4003, reason="no active session")
             return
-        if qs_session and qs_session != node.session_id:
-            await websocket.close(code=4001, reason="session_id mismatch")
+        if not qs_session or qs_session != node.session_id:
+            await websocket.close(code=4001, reason="session_id required and must match")
+            return
+        # did 校验：如果 ws 带了 did，必须匹配会话对端
+        if qs_did and node.peer_name and qs_did != node.peer_name:
+            await websocket.close(code=4002, reason="did mismatch")
             return
 
         await websocket.accept()

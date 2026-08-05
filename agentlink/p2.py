@@ -586,12 +586,20 @@ def add_channel_relay(app: FastAPI, relay: ChannelRelay,
 
                 elif method == "agentlink.channel.members":
                     channel_id = body.get("channel_id", "")
+                    # 校验成员身份：查看成员列表也需要是频道成员
+                    if not relay._is_member(channel_id, agent_did):
+                        await websocket.send_json({"result": "error", "msg": "not a member"})
+                        continue
                     members = relay.get_members(channel_id)
                     await websocket.send_json({"result": members})
 
                 elif method == "agentlink.channel.history":
                     channel_id = body.get("channel_id", "")
                     limit = body.get("limit", 50)
+                    # 校验成员身份：查看历史也需要是频道成员
+                    if not relay._is_member(channel_id, agent_did):
+                        await websocket.send_json({"result": "error", "msg": "not a member"})
+                        continue
                     history = relay.get_history(channel_id, limit)
                     await websocket.send_json({"result": history})
 
@@ -660,7 +668,12 @@ def add_channel_relay(app: FastAPI, relay: ChannelRelay,
         return JSONResponse({"result": "broadcast", "channel_id": channel_id, "sent": sent})
 
     @app.get(f"{prefix}/history/{{channel_id}}")
-    async def api_channel_history(channel_id: str, limit: int = 50):
+    async def api_channel_history(channel_id: str, limit: int = 50, req: Request = None):
+        # 校验成员身份
+        auth = req.headers.get("Authorization", "") if req else ""
+        token_did = auth[7:] if auth.startswith("Bearer ") else ""
+        if not token_did or not relay._is_member(channel_id, token_did):
+            return JSONResponse({"error": "not a member of this channel"}, status_code=403)
         return JSONResponse({"result": relay.get_history(channel_id, limit)})
 
     return app

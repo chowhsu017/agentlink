@@ -85,7 +85,7 @@ class SecureSessionManager:
         return enc_b64, sign_b64, did
 
     async def on_ring(self, caller_name: str, session_id: str):
-        """接收到呼叫——使用对方公钥建立 cipher"""
+        """接收到呼叫——作为 responder 用对方公钥建立 cipher，并生成 salt 供 initiator 复用"""
         peer_enc_b64, peer_sign_b64, peer_did = self._peer_from_ctx()
 
         if peer_enc_b64 and peer_sign_b64:
@@ -94,8 +94,9 @@ class SecureSessionManager:
             shared = compute_shared_secret(self.kp.enc_private, peer_enc)
             key, salt = derive_session_key(shared)
             self.cipher = SessionCipher(key, salt, self.kp.did, peer_did)
-            # 保存 salt 给后续 accept 回复
+            # 保存给 initiator 复用——通过 ring 响应传回
             self.state._session_salt = salt
+            self.state._session_key = key
             self.state._peer_did = peer_did
             self.state._peer_sign_public = peer_sign
             self.state._peer_enc_public = peer_enc
@@ -108,16 +109,31 @@ class SecureSessionManager:
             await self._ring_hook(caller_name, session_id)
 
     async def on_accept(self):
-        """接受方——用已有的 cipher 或建立新的"""
-        # 如果 ring 时已建立 cipher，直接复用
+        """接受方——用 ring 阶段已建立的 cipher，或从 peer 取盐"""
+        # 如果 ring 时已建立 cipher，直接复用（responder 路径）
         if self.cipher:
             if self._accept_hook:
                 await self._accept_hook()
             return
 
+        # initiator 路径：从 ring 响应中拿到的 salt
+        stored_salt = getattr(self.state, '_session_salt', None)
         peer_enc_b64, peer_sign_b64, peer_did = self._peer_from_ctx()
 
-        if peer_enc_b64 and peer_sign_b64:
+        if peer_enc_b64 and peer_sign_b64 and stored_salt is not None:
+            peer_enc = _unb64(peer_enc_b64)
+            peer_sign = _unb64(peer_sign_b64)
+            shared = compute_shared_secret(self.kp.enc_private, peer_enc)
+            # 复用 responder 的 salt，而不是生成新的
+            key, _ = derive_session_key(shared, stored_salt)
+            self.cipher = SessionCipher(key, stored_salt, self.kp.did, peer_did)
+            self.state._peer_did = peer_did
+            self.state._peer_sign_public = peer_sign
+            self.state._peer_enc_public = peer_enc
+            self.e2ee_enabled = True
+            print(f"  🔐 {self.state.name}: 加密会话已建立 (→ {peer_did}) [复用 salt]")
+        elif peer_enc_b64 and peer_sign_b64:
+            # 兜底：无预存储 salt 时自己生成（旧协议兼容）
             peer_enc = _unb64(peer_enc_b64)
             peer_sign = _unb64(peer_sign_b64)
             shared = compute_shared_secret(self.kp.enc_private, peer_enc)
@@ -128,7 +144,7 @@ class SecureSessionManager:
             self.state._peer_sign_public = peer_sign
             self.state._peer_enc_public = peer_enc
             self.e2ee_enabled = True
-            print(f"  🔐 {self.state.name}: 加密会话已建立 (→ {peer_did})")
+            print(f"  ⚠️ {self.state.name}: 加密会话已建立 (→ {peer_did}) [降级: 无共享 salt]")
 
         if self._accept_hook:
             await self._accept_hook()

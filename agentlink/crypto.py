@@ -134,8 +134,18 @@ def sign_did_binding(kp: AgentKeyPair) -> dict:
     }
 
 def verify_did_binding(cert: dict) -> bool:
+    """验证 DID 绑定凭证：签名有效性 + DID 指纹与 sign_public 绑定"""
+    # 1. 验证签名
     payload = _json_bytes({"did": cert["did"], "timestamp": cert["timestamp"], "enc_public_b64": cert["enc_public_b64"]})
-    return verify_message(_unb64(cert["sign_public_b64"]), payload, _unb64(cert["signature_b64"]))
+    if not verify_message(_unb64(cert["sign_public_b64"]), payload, _unb64(cert["signature_b64"])):
+        return False
+    # 2. 验证 DID 指纹：DID 最后一个冒号后的 16 字符应 = sign_public_b64 的前 16 字符
+    did = cert.get("did", "")
+    fp_from_did = did.rsplit(":", 1)[-1] if ":" in did else ""
+    fp_from_sign = cert.get("sign_public_b64", "")[:16]
+    if fp_from_did and fp_from_sign and fp_from_did != fp_from_sign:
+        return False
+    return True
 
 def save_keypair(kp: AgentKeyPair, path: str):
     with open(path, "w") as f:
