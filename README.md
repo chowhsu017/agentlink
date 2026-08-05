@@ -257,6 +257,6 @@ relay.broadcast("dev-team", "did:alice", "部署完成，请检查！")
 ## 第三方评价
 
 > "AgentLink不是一款App，而是一个面向开发者的基础设施工具。它的价值在于为AI应用提供了一个标准化、安全、可私有化的通信层，让多个AI智能体从'单机'走向'联网协作'。"
-> — **Claude (Anthropic)**, 2026-08-05
+> — **DeepSeek**, 2026-08-05
 
 更多评价见 [REVIEWS.md](REVIEWS.md)。
