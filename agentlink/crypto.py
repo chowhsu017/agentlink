@@ -140,6 +140,8 @@ def verify_did_binding(cert: dict) -> bool:
 def save_keypair(kp: AgentKeyPair, path: str):
     with open(path, "w") as f:
         json.dump(kp.to_save(), f, indent=2)
+    # 设置文件权限 600（仅 owner 读写）
+    os.chmod(path, 0o600)
 
 def load_keypair(path: str) -> AgentKeyPair:
     with open(path) as f:
@@ -175,13 +177,14 @@ class SessionCipher:
 
     @classmethod
     def establish_x3dh_initiator(cls, my_kp: AgentKeyPair, peer_ik: bytes,
-                                  peer_spk: bytes, peer_ek: bytes, peer_did: str) -> Tuple[SessionCipher, bytes]:
+                                  peer_spk: bytes, peer_ek: bytes, peer_did: str) -> Tuple['SessionCipher', bytes]:
+        """X3DH Initiator: IK_own·SPK_peer + EK·IK_peer + EK·SPK_peer"""
         ek = x25519.X25519PrivateKey.generate()
         ek_pub = ek.public_key().public_bytes_raw()
         ek_priv = ek.private_bytes_raw()
-        dh1 = compute_shared_secret(my_kp.enc_private, peer_spk)
-        dh2 = compute_shared_secret(ek_priv, peer_ik)
-        dh3 = compute_shared_secret(ek_priv, peer_spk)
+        dh1 = compute_shared_secret(my_kp.enc_private, peer_spk)      # IK_own · SPK_peer
+        dh2 = compute_shared_secret(ek_priv, peer_ik)                  # EK_own · IK_peer
+        dh3 = compute_shared_secret(ek_priv, peer_spk)                 # EK_own · SPK_peer
         combined = dh1 + dh2 + dh3
         key, salt = derive_session_key(combined)
         cipher = cls(key, salt, my_kp.did, peer_did)
@@ -191,15 +194,22 @@ class SessionCipher:
         return cipher, ek_pub
 
     @classmethod
-    def establish_x3dh_responder(cls, my_kp: AgentKeyPair, peer_ik: bytes,
-                                  peer_ek: bytes, peer_did: str, salt: bytes) -> SessionCipher:
-        dh1 = compute_shared_secret(my_kp.enc_private, peer_ik)
-        dh2 = compute_shared_secret(my_kp.enc_private, peer_ek)
-        dh3 = compute_shared_secret(my_kp.enc_private, peer_ek)
+    def establish_x3dh_responder(cls, my_kp: AgentKeyPair, my_spk_private: bytes,
+                                  peer_ik: bytes, peer_spk: bytes, peer_ek: bytes,
+                                  peer_did: str, salt: bytes) -> 'SessionCipher':
+        """X3DH Responder: SPK_own·IK_peer + SPK_own·EK_peer + SPK_own·SPK_peer
+        三组 DH 与 Initiator 侧对称：
+          Initiator dh1(IK_own·SPK_peer) ↔ Responder dh3(SPK_own·SPK_peer)
+          Initiator dh2(EK·IK_peer)       ↔ Responder dh1(SPK_own·IK_peer)
+          Initiator dh3(EK·SPK_peer)      ↔ Responder dh2(SPK_own·EK_peer)
+        """
+        dh1 = compute_shared_secret(my_spk_private, peer_ik)     # SPK_own · IK_peer
+        dh2 = compute_shared_secret(my_spk_private, peer_ek)     # SPK_own · EK_peer
+        dh3 = compute_shared_secret(my_spk_private, peer_spk)    # SPK_own · SPK_peer
         combined = dh1 + dh2 + dh3
         key, _ = derive_session_key(combined, salt)
         cipher = cls(key, salt, my_kp.did, peer_did)
-        cipher._x3dh_ek_private = my_kp.enc_private
+        cipher._x3dh_ek_private = my_spk_private
         cipher._own_enc_private = my_kp.enc_private
         cipher._peer_ik = peer_ik
         return cipher

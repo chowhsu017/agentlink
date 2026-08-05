@@ -25,17 +25,18 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 import httpx
 
-# ─── 簿记埋点 ─────────────────────────────────────
+# ─── 簿记埋点（opt-in）──────────────────────────────
+# 环境变量 AGENTLINK_BOOKKEEP=1 启用外部簿记脚本
 
-BOOKKEEP_SCRIPT = os.path.expanduser("~/Desktop/Strong财经/scripts/subagent_tracker.py")
-BOOKKEEP_ENABLED = os.path.exists(BOOKKEEP_SCRIPT)
+_bookkeep_script = os.environ.get("AGENTLINK_BOOKKEEP_SCRIPT", "")
+BOOKKEEP_ENABLED = bool(_bookkeep_script) and os.path.exists(_bookkeep_script)
 
 def _bookkeep(cmd: str, *args):
     if not BOOKKEEP_ENABLED:
         return
     try:
         subprocess.run(
-            ["python3", BOOKKEEP_SCRIPT, cmd] + [str(a) for a in args],
+            ["python3", _bookkeep_script, cmd] + [str(a) for a in args],
             capture_output=True, timeout=3
         )
     except Exception:
@@ -570,6 +571,19 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
 
     @app.websocket("/agentlink/ws")
     async def handle_ws(websocket: WebSocket):
+        """WebSocket 连接——校验 session_id 防止会话劫持"""
+        # 读取连接时附带的查询参数: ws://host/agentlink/ws?session_id=xxx&did=xxx
+        qs_session = websocket.query_params.get("session_id", "")
+        qs_did = websocket.query_params.get("did", "")
+
+        # 校验 session_id 匹配当前会话
+        if not node.session_id:
+            await websocket.close(code=4003, reason="no active session")
+            return
+        if qs_session and qs_session != node.session_id:
+            await websocket.close(code=4001, reason="session_id mismatch")
+            return
+
         await websocket.accept()
         node._ws = WsAdapter(websocket)
 

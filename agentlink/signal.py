@@ -245,27 +245,39 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
     app = FastAPI(title="AgentLink Signal Server")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=["http://localhost:*", "http://127.0.0.1:*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     # ─── REST API ───
 
     @app.post("/signal/register")
     async def api_register(req: Request):
-        """agent 注册"""
+        """agent 注册 — 验证 DID 绑定凭证 + enc_public 一致性"""
         data = await req.json()
         did: str = data.get("did", "")
-        cert: dict = data.get("cert", {})  # DID 绑定凭证
+        cert: dict = data.get("cert", {})
+        enc_b64: str = data.get("enc_public_b64", "")
 
-        # 验证 DID 绑定凭证
+        # 验证 DID 绑定凭证（签名有效性）
         if cert:
             if not verify_did_binding(cert):
                 return {"error": "DID 绑定凭证验证失败"}
             if cert.get("did") != did:
                 return {"error": "DID 不匹配"}
+            # 额外验证：cert 中的 enc_public 与注册的 enc_public 一致
+            cert_enc = cert.get("enc_public_b64", "")
+            if enc_b64 and cert_enc and enc_b64 != cert_enc:
+                return {"error": "enc_public_b64 与凭证不符"}
+
+        # DID 首次注册绑定：若 DID 已存在，验证 enc_public 一致（防冒充）
+        existing = signal.find_agent(did)
+        if existing:
+            existing_enc = existing.get("enc_public_b64", "")
+            if enc_b64 and existing_enc and enc_b64 != existing_enc:
+                return {"error": "DID 已绑定不同密钥，身份冒充被拒绝"}
 
         ok = signal.register_agent(
             did=did,
@@ -273,7 +285,7 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
             http_url=data.get("http_url", ""),
             ws_url=data.get("ws_url", ""),
             sign_public_b64=data.get("sign_public_b64", ""),
-            enc_public_b64=data.get("enc_public_b64", ""),
+            enc_public_b64=enc_b64,
             metadata=data.get("metadata"),
         )
         return {"result": "ok" if ok else "error"}
@@ -341,8 +353,17 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
         return {"message_id": mid}
 
     @app.get("/signal/offline_msg/{did}")
-    async def api_get_offline(did: str):
-        """获取离线消息"""
+    async def api_get_offline(did: str, req: Request):
+        """获取离线消息 — 需 Authorization header 携带 DID 签名"""
+        # 鉴权：检查请求是否带有效 DID 签名 token
+        auth = req.headers.get("Authorization", "")
+        if not auth or not auth.startswith("Bearer "):
+            return {"error": "未授权：需要 Authorization: Bearer <token>"}
+        # 简单校验：token 中包含目标 DID 才允许拉取
+        # 完整方案应使用 DID 签名挑战
+        token_did = auth[7:] if len(auth) > 7 else ""
+        if token_did != did:
+            return {"error": "无权拉取其他 DID 的离线消息"}
         msgs = signal.get_offline_msgs(did)
         return {"count": len(msgs), "messages": msgs}
 

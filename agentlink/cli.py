@@ -32,7 +32,7 @@ def cmd_serve(args):
     add_channel_relay(app, channel_relay)
     add_presence_federation(app, signal)
 
-    host = args.host or "0.0.0.0"
+    host = args.host or "127.0.0.1"
     port = args.port or 9765
 
     print(f"\n🚀 AgentLink 服务启动 @ {host}:{port}")
@@ -125,7 +125,7 @@ def cmd_signal(args):
     )
     app = create_signal_app(signal)
 
-    host = args.host or "0.0.0.0"
+    host = args.host or "127.0.0.1"
     port = args.port or 9765
     print(f"\n📡 AgentLink 信令服务 @ {host}:{port}")
     print(f"   DID:       {signal.kp.did}")
@@ -188,7 +188,7 @@ def main():
     # serve
     p_serve = sub.add_parser("serve", help="启动完整 AgentLink 服务（信令+频道+Presence）")
     p_serve.add_argument("--port", type=int, default=9765, help="端口 (默认 9765)")
-    p_serve.add_argument("--host", default="0.0.0.0", help="监听地址 (默认 0.0.0.0)")
+    p_serve.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1)")
     p_serve.add_argument("--db", help="信号数据库路径 (默认 ~/.agentlink/signal.db)")
     p_serve.add_argument("--key", help="服务密钥路径 (默认 ~/.agentlink/signal_key.json)")
     p_serve.add_argument("--channel-db", help="频道数据库路径 (默认 ~/.agentlink/channels.db)")
@@ -198,7 +198,7 @@ def main():
     # signal (仅信令服务，轻量模式)
     p_signal = sub.add_parser("signal", help="启动信令服务（仅信令，不含频道/Presence）")
     p_signal.add_argument("--port", type=int, default=9765, help="端口 (默认 9765)")
-    p_signal.add_argument("--host", default="0.0.0.0", help="监听地址")
+    p_signal.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_signal.add_argument("--db", help="数据库路径")
     p_signal.add_argument("--key", help="密钥路径")
     p_signal.set_defaults(func=cmd_signal)

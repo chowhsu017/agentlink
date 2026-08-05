@@ -28,6 +28,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from .crypto import derive_session_key, _unb64
 
 # 从 agentlink_p1 导入核心类型
 import sys, os as _os
@@ -210,6 +211,14 @@ class ChannelRelay:
         ).fetchall()
         return [{"did": r[0], "enc_public_b64": r[1], "joined_at": r[2]} for r in rows]
 
+    def _is_member(self, channel_id: str, agent_did: str) -> bool:
+        """检查 agent 是否为频道成员"""
+        row = self.conn.execute(
+            "SELECT 1 FROM channel_members WHERE channel_id=? AND agent_did=?",
+            (channel_id, agent_did)
+        ).fetchone()
+        return row is not None
+
     # ─── WS 订阅管理 ─────────────────────────
 
     async def ws_connect(self, ws: WebSocket, agent_did: str, name: str = ""):
@@ -383,11 +392,30 @@ class ChannelRelay:
 
     def derive_channel_key(self, channel_id: str) -> bytes:
         """
-        从频道的所有会员公钥派生出群组密钥
-        使用 deterministic 哈希：channel_id → SHA256
-        这是最简单的方案——更完整的方案应使用 MLS 或 TreeKEM
+        从频道创建者密钥派生组密钥。
+        仅当 creator 提供了 e2ee 参数且成员完备时才生成真实密钥；
+        否则返回 None（调用方应拒绝加密或回退到成员间 DH）。
         """
-        return hashlib.sha256(f"agentlink:channel:{channel_id}:e2ee".encode()).digest()
+        channel = self.get_channel(channel_id)
+        if not channel or not channel.get("e2ee"):
+            return None  # 频道未启用 E2EE，不生成假密钥
+        owner_did = channel.get("owner")
+        owner_key = channel.get("owner_enc_public_b64")
+        if not owner_key:
+            # 尝试从成员列表查找 owner 公钥
+            members = self.get_members(channel_id)
+            for m in members:
+                if m["did"] == owner_did:
+                    owner_key = m.get("enc_public_b64")
+                    break
+        if not owner_key:
+            return None
+        # 派生方式：channel_id + owner_pubkey → HKDF，不是纯常量
+        return derive_session_key(
+            hashlib.sha256(
+                f"agentlink:channel:{channel_id}".encode() + _unb64(owner_key)
+            ).digest()
+        )[0]
 
     def get_channel_cipher(self, channel_id: str, my_did: str, peer_did: str) -> SessionCipher:
         """获取两个频道成员之间的加密器"""
@@ -538,6 +566,10 @@ def add_channel_relay(app: FastAPI, relay: ChannelRelay,
                     payload = body.get("payload", "")
                     msg_type = body.get("type", "text")
                     encrypted = body.get("encrypted", False)
+                    # 校验成员身份
+                    if not relay._is_member(channel_id, agent_did):
+                        await websocket.send_json({"result": "error", "msg": "not a member"})
+                        continue
                     sent = await relay.broadcast(channel_id, agent_did, payload, msg_type, encrypted)
                     await websocket.send_json({"result": "broadcast", "channel_id": channel_id, "sent": sent})
 
@@ -621,6 +653,9 @@ def add_channel_relay(app: FastAPI, relay: ChannelRelay,
         sender_did = data.get("sender_did", "")
         payload = data.get("payload", "")
         msg_type = data.get("type", "text")
+        # 校验成员身份
+        if not relay._is_member(channel_id, sender_did):
+            return JSONResponse({"error": "not a member of this channel"}, status_code=403)
         sent = await relay.broadcast(channel_id, sender_did, payload, msg_type)
         return JSONResponse({"result": "broadcast", "channel_id": channel_id, "sent": sent})
 
