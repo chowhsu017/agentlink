@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentLink Timeline — {name}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#e6edf3;padding:20px;max-width:1200px;margin:0 auto}
+h1{font-size:1.5rem;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:8px}
+.sub{color:#8b949e;font-size:.85rem;margin-bottom:20px}
+.stats{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+.stat{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 20px}
+.stat label{display:block;font-size:.75rem;color:#8b949e;text-transform:uppercase}
+.stat value{font-size:1.4rem;font-weight:600;font-variant-numeric:tabular-nums}
+.timeline{position:relative;padding-left:30px}
+.timeline::before{content:'';position:absolute;left:12px;top:0;bottom:0;width:2px;background:#30363d}
+.event{position:relative;padding:6px 0 6px 16px;border-bottom:1px solid #21262d}
+.event:last-child{border-bottom:none}
+.event::before{content:'';position:absolute;left:-24px;top:12px;width:10px;height:10px;border-radius:50%;border:2px solid}
+.event.call::before{border-color:#58a6ff;background:#1f3a5f}
+.event.accept::before{border-color:#3fb950;background:#1b3a24}
+.event.register::before{border-color:#d29922;background:#3a2e1b}
+.event.hangup::before{border-color:#f85149;background:#3a1b1b}
+.event.reject::before{border-color:#f85149;background:#3a1b1b}
+.event.ws_open::before{border-color:#79c0ff;background:#1a3a5a}
+.event.ws_close::before{border-color:#e3b341;background:#3a2e1b}
+.event.data_tx::before{border-color:#a5d6ff;background:#1a3a5a}
+.event.data_rx::before{border-color:#7ee787;background:#1b3a24}
+.event.hb::before{border-color:#8b949e;background:#22262d}
+.event.hb_timeout::before{border-color:#f85149;background:#3a1b1b}
+.event-time{font-size:.75rem;color:#8b949e;font-variant-numeric:tabular-nums;min-width:80px;display:inline-block}
+.event-ts{font-size:.75rem;color:#484f58;margin-left:4px}
+.event-detail{color:#7d8590;font-size:.85rem;margin-left:8px}
+.event-type{display:inline-block;font-size:.7rem;padding:1px 6px;border-radius:4px;margin-left:4px}
+.event.call .event-type{background:#1f3a5f;color:#58a6ff}
+.event.accept .event-type{background:#1b3a24;color:#3fb950}
+.event.register .event-type{background:#3a2e1b;color:#d29922}
+.event.hangup .event-type{background:#3a1b1b;color:#f85149}
+.event.reject .event-type{background:#3a1b1b;color:#f85149}
+.event.ws_open .event-type{background:#1a3a5a;color:#79c0ff}
+.event.ws_close .event-type{background:#3a2e1b;color:#e3b341}
+.event.data_tx .event-type{background:#1a3a5a;color:#58a6ff}
+.event.data_rx .event-type{background:#1b3a24;color:#7ee787}
+.event.hb .event-type{background:#22262d;color:#8b949e}
+.agent-badge{display:inline-block;font-size:.7rem;padding:1px 6px;border-radius:4px;background:#1f2a3f;color:#79c0ff;margin-left:4px}
+.connecting{color:#8b949e;text-align:center;padding:40px;font-style:italic}
+.error{color:#f85149;text-align:center;padding:20px}
+</style>
+</head>
+<body>
+<h1>📡 AgentLink 通联时间线 <span class="agent-badge">{name}</span></h1>
+<div class="sub">端口 {port} · SSE 实时推送</div>
+<div class="stats">
+  <div class="stat"><label>事件总数</label><value id="count">0</value></div>
+  <div class="stat"><label>数据帧 TX</label><value id="tx">0</value></div>
+  <div class="stat"><label>数据帧 RX</label><value id="rx">0</value></div>
+  <div class="stat"><label>最后更新</label><value id="ts">--</value></div>
+</div>
+<div class="timeline" id="timeline">
+  <div class="connecting">等待事件...</div>
+</div>
+<script>
+const evtSource = new EventSource('/timeline/stream');
+const timeline = document.getElementById('timeline');
+const countEl = document.getElementById('count');
+const txEl = document.getElementById('tx');
+const rxEl = document.getElementById('rx');
+const tsEl = document.getElementById('ts');
+let events = [];
+const EVENT_LABELS = {
+  call:'📞呼叫', ring:'🔔振铃', accept:'✅接通', reject:'❌拒绝', register:'📋注册',
+  ws_open:'🔗WS开', ws_close:'⚠️WS关',
+  data_tx:'📤发送', data_rx:'📥收到',
+  hb:'💓心跳', hb_timeout:'💔超时', hangup:'🔌断开'
+};
+
+evtSource.onmessage = function(e) {
+  try {
+    const evt = JSON.parse(e.data);
+    events.push(evt);
+    if (events.length > 500) events.shift();
+    render();
+  } catch(err) {}
+};
+
+function render() {
+  timeline.innerHTML = events.slice().reverse().map(e => {
+    const label = EVENT_LABELS[e.event] || e.event;
+    return `<div class="event ${e.event}">
+      <span class="event-time">${e.ts_str}</span>
+      <span class="event-type">${label}</span>
+      <span class="agent-badge">${e.agent}</span>
+      <span class="event-detail">${e.detail}</span>
+    </div>`;
+  }).join('');
+  countEl.textContent = events.length;
+  txEl.textContent = events.filter(e => e.event === 'data_tx').length;
+  rxEl.textContent = events.filter(e => e.event === 'data_rx').length;
+  tsEl.textContent = events.length > 0 ? events[events.length-1].ts_str : '--';
+  if (events.length > 0) {
+    const last = events[events.length-1];
+    document.title = `AgentLink [${last.ts_str}] ${last.event} — {name}`;
+  }
+}
+
+evtSource.onerror = function() {
+  timeline.innerHTML = '<div class="error">⚠️ SSE 连接断开，请刷新页面</div>';
+};
+</script>
+</body>
+</html>
