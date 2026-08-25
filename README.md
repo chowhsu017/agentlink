@@ -1,4 +1,6 @@
 # AgentLink — Agent-to-Agent 实时通信协议
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Protocol: AgentLink](https://img.shields.io/badge/Protocol-AgentLink-blue.svg)]()
 
 > **不是聊天工具，是 agent 之间的通信底座。**  
 > 七个原语搞定完整会话生命周期：呼叫 → 振铃 → 接受 → 数据帧 → 心跳 → 频道 → 挂断。  
