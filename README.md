@@ -204,9 +204,14 @@ from agentlink import (
 ```python
 from agentlink.signal_client import SignalClient
 
-client = SignalClient(server_url="http://your-server:9765")
-await client.register(did, name, enc_public_b64, http_url, ws_url)
-agents = await client.discover()
+# 注意：信令客户端需要传入 state(含 name/http_url/ws_url) 和 secure(E2EE 管理器)
+# 通过 create_agent_app / create_secure_agent 构建，而非旧文档的 server_url 写法
+state, secure = create_secure_agent("my-agent", 18763, keypair_path="my.key.json")
+client = SignalClient(state, secure, "http://your-server:9765")
+await client.register()          # 注册到信令服务
+agents = await client.list_online()   # 查看在线 agent
+found = await client.find("did:agentlink:bob:xxxx")   # 查找
+await client.connect_ws()        # 保持 WS 长连（在线 + 收消息）
 ```
 
 ### 频道中继 (`agentlink.p2`)
@@ -219,6 +224,40 @@ relay.create_channel("dev-team", "开发组", "did:alice")
 relay.join_channel("dev-team", "did:bob")
 relay.broadcast("dev-team", "did:alice", "部署完成，请检查！")
 ```
+
+---
+
+## 实战：跨机端到端加密 + 远程资源调用
+
+> 两台真正的 Mac 在同一个局域网内，不经过云端，跑通了「端到端加密通话 → 远程调用对端本地能力」完整链路。
+
+### 怎么跑（两台机器，一台作服务端/执行端，一台作客户端/请求端）
+
+**服务端/执行端**（例如有素材库、算力、脚本的那台）：
+```bash
+# 启动完整 agent：HTTP + WS 端点 + 注册信令 + 保持在线
+python e2ee_agent_tiger_mac.py            # 或你自己的 agent 应用
+# capability_service.py 注册了对端发来的命令处理（@search → 本地检索 → 加密回传）
+```
+
+**客户端/请求端**（想借用对端资源的那台）：
+```bash
+export AGENTLINK_PEER_HTTP="http://<执行端IP>:18799" \
+       AGENTLINK_PEER_WS="ws://<执行端IP>:18799/agentlink/ws" \
+       AGENTLINK_PEER_DID="did:agentlink:<执行端>" \
+       AGENTLINK_MY_KEY="~/.agentlink/my.key.json" \
+       AGENTLINK_MY_IP="<本机IP>"
+python send_interactive.py
+# 出现提示符后输入：
+#   @search <关键词>   → 加密请求对端搜索其本地素材库，结果加密回传并解密显示
+#   其他任意文字      → 作为普通加密消息发送
+```
+
+> 所有机器信息（密钥路径 / IP / DID）均通过环境变量配置，不硬编码，便于安全分发，避免泄漏局域网拓扑。
+
+### 联调暴露并修复的 5 个协议缺陷
+
+详见 [`CHANGELOG.md`](CHANGELOG.md)。一句话——本地自测通过 ≠ 跨机能跑：E2EE 是 P2P 对称协商，任何一侧实现不一致（坏 import、上下文未写入、🔒 前缀未剥离、占位符 DID、async 未 await）都会在跨机握手时暴露。**补丁必须两侧同步，否则不对称即失败。**
 
 ---
 

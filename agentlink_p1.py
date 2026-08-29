@@ -143,6 +143,17 @@ class AgentLinkState:
         self.on_accept: Optional[Callable] = None # accept()
         self.on_hangup: Optional[Callable] = None # hangup(reason)
 
+        # E2EE：secure 管理器（initiator 发 call 时从中取加密公钥）
+        self.secure: Optional["SecureSessionManager"] = None
+
+        # E2EE：呼叫上下文（responder 收到 call 时写入对端公钥）
+        self._call_context: dict = {}
+        # E2EE：会话密钥派生上下文（initiator 从 ring 响应复用 salt）
+        self._session_salt: Optional[bytes] = None
+        self._session_key: Optional[bytes] = None
+        self._peer_enc_public: Optional[bytes] = None
+        self._peer_sign_public: Optional[bytes] = None
+
         # P2: 频道
         self.channels: dict[str, set] = {}  # channel_id → {subscriber WS}
 
@@ -150,6 +161,29 @@ class AgentLinkState:
         self._presence_clients: dict[str, asyncio.Queue] = {}
         self.presence_status: dict[str, dict] = {}
         self._publish_own_presence()
+
+    # ─── E2EE 公钥辅助 ──────────────────────────────
+    def _e2ee_enc_public_b64(self) -> str:
+        """返回本 agent 的 X25519 加密公钥 (base64)；无 secure 时返回空（明文降级）"""
+        sec = getattr(self, "secure", None)
+        if sec is not None and getattr(sec, "kp", None) is not None:
+            try:
+                from agentlink import _b64
+                return _b64(sec.kp.enc_public)
+            except Exception:
+                return ""
+        return ""
+
+    def _e2ee_sign_public_b64(self) -> str:
+        """返回本 agent 的 Ed25519 签名公钥 (base64)；无 secure 时返回空"""
+        sec = getattr(self, "secure", None)
+        if sec is not None and getattr(sec, "kp", None) is not None:
+            try:
+                from agentlink import _b64
+                return _b64(sec.kp.sign_public)
+            except Exception:
+                return ""
+        return ""
 
     def tlog(self, event_type: str, detail: str = "", session_id: str = ""):
         """记录 timeline 事件"""
@@ -378,8 +412,36 @@ def create_agent_app(state: AgentLinkState):
         state.tlog("call", f"来自 {caller_name} 的呼叫", session_id)
         print(f"\n📞 {state.name}: 收到来自 {caller_name} 的呼叫 (session={session_id[:8]}...)")
 
+        # E2EE: 把 initiator 携带的加密公钥写进呼叫上下文，供 on_ring / _peer_from_ctx 读取
+        enc_b64 = body.get("enc_public_b64", "")
+        sign_b64 = body.get("sign_public_b64", "")
+        state._call_context = {
+            "enc_public_b64": enc_b64,
+            "sign_public_b64": sign_b64,
+            "caller_did": caller_did,
+            "did": caller_did,
+        }
+
         if state.on_ring:
-            state.on_ring(caller_name, session_id)
+            # on_ring 可能是 async（secure.on_ring）——await 它
+            r = state.on_ring(caller_name, session_id)
+            if hasattr(r, "__await__"):
+                await r
+
+        # E2EE: ring 响应回传 responder 的加密公钥 + salt + 真实 peer_did，
+        # 供 initiator 复用派生 cipher（peer_did 用于 AD 对称，覆盖 initiator 的占位符 DID）
+        resp_extra = {}
+        sec = getattr(state, "secure", None)
+        if sec is not None:
+            try:
+                from agentlink import _b64
+                resp_extra["peer_did"] = state.did
+                resp_extra["enc_public_b64"] = _b64(sec.kp.enc_public)
+                resp_extra["sign_public_b64"] = _b64(sec.kp.sign_public)
+                if getattr(state, "_session_salt", None):
+                    resp_extra["salt"] = _b64(state._session_salt)
+            except Exception:
+                pass
 
         return rpc_result({
             "type": "ring",
@@ -387,6 +449,7 @@ def create_agent_app(state: AgentLinkState):
             "ring_at": time.strftime("%H:%M:%S"),
             "timeout_sec": 30,
             "ws_url": f"{state.ws_url}/{session_id}",
+            **resp_extra,
         })
 
     @app.post("/agentlink/accept")
@@ -620,7 +683,32 @@ def create_agent_app(state: AgentLinkState):
                         state.tlog("data_tx", f"[auto] {reply_text[:60]}", sid)
                         print(f"  📤 {state.name} [auto] 回复: \"{reply_text[:60]}\"")
                     elif state.on_data:
-                        state.on_data(payload, seq, dtype)
+                        # on_data 可能是 async（secure.on_data）——await 它，否则加密帧不解密
+                        r = state.on_data(payload, seq, dtype)
+                        if hasattr(r, "__await__"):
+                            await r
+                        # ─── 跨机资源调用：解密后识别命令并执行 ───
+                        plain = getattr(state, "_last_decrypted", None)
+                        if plain:
+                            try:
+                                import capability_service as cap
+                                resp = cap.handle(plain)
+                                if resp:
+                                    # 加密回传：用 responder 的 cipher 加密，就地发回 caller
+                                    sec = getattr(state, "secure", None)
+                                    enc_resp = sec.encrypt_payload(resp) if (sec and getattr(sec, "cipher", None)) else resp
+                                    reply_seq = state.next_seq()
+                                    reply_frame = ws_message("agentlink.data", state, {
+                                        "seq": reply_seq,
+                                        "type": "text",
+                                        "payload": enc_resp,
+                                    })
+                                    await websocket.send_json(reply_frame)
+                                    state.frames_sent += 1
+                                    state.tlog("data_tx", f"[cap] {resp[:50]}", sid)
+                                    print(f"  📤 {state.name} [cap] 能力响应: \"{str(resp)[:50]}\"")
+                            except Exception as e:
+                                print(f"  ⚠️ {state.name}: 能力处理异常: {e}")
 
                 elif method == "agentlink.heartbeat":
                     state._hb_missed = 0
@@ -829,6 +917,10 @@ class AgentLinkClient:
                     "caller_name": self.me.name,
                     "caller_url": self.me.http_url,
                     "caller_ws": f"{self.me.ws_url}/{session_id}",
+                    # E2EE: initiator 携带自己的加密/签名公钥，供 responder 建 cipher
+                    # (从 self.secure 取；由 e2ee agent 注入)
+                    "enc_public_b64": self._e2ee_enc_public_b64(),
+                    "sign_public_b64": self._e2ee_sign_public_b64(),
                     "capabilities": capabilities or {
                         "stream_types": ["text", "json"],
                         "heartbeat_interval": HEARTBEAT_INTERVAL,
@@ -847,6 +939,31 @@ class AgentLinkClient:
                 peer_ws = result.get("ws_url", "")
                 if peer_ws:
                     self.me.peer_ws = peer_ws
+                # E2EE: responder 在 ring 响应回传真实 peer_did —— 覆盖 call() 预设的占位符 DID
+                #（_ad_for_seq 绑定排序后的双方 DID 对，peer_did 必须是 responder 真实 DID 否则 AEAD 不对称）
+                real_peer_did = result.get("peer_did", "")
+                if real_peer_did:
+                    self.me.peer_did = real_peer_did
+                # E2EE: responder 在 ring 响应回传 对端(enc_public_b64/sign_public_b64) + salt/key
+                peer_enc = result.get("enc_public_b64")
+                peer_sign = result.get("sign_public_b64")
+                salt_b64 = result.get("salt")
+                if peer_enc and salt_b64:
+                    # initiator 用 responder 的 enc 公钥 + responder 生成的共享 salt 派生自己的 cipher
+                    from agentlink import _unb64, compute_shared_secret, derive_session_key, SessionCipher
+                    peer_enc_bytes = _unb64(peer_enc)
+                    shared = compute_shared_secret(self.me.secure.kp.enc_private, peer_enc_bytes)
+                    # 关键：复用 responder 的盐（salt_b64），否则两侧盐不同 → 不对称解密失败
+                    key, salt = derive_session_key(shared, _unb64(salt_b64))
+                    self.me.secure.cipher = SessionCipher(key, salt, self.me.did, self.me.peer_did)
+                    self.me.secure.peer_cipher = SessionCipher(key, salt, self.me.peer_did, self.me.did)  # 对称镜像（key/salt 相同）
+                    self.me.secure.e2ee_enabled = True
+                    self.me.secure._peer_enc_public = peer_enc_bytes
+                    if peer_sign:
+                        self.me.secure._peer_sign_public = _unb64(peer_sign)
+                    print(f"  🔐 {self.me.name}: 加密会话已建立 (→ {self.me.peer_did})")
+                else:
+                    print(f"  ⚠️ {self.me.name}: ring 响应未带加密材料，通信不加密")
                 return True
             elif result.get("type") == "busy":
                 print(f"  ❌ {self.me.name}: {target_name} 占线 (在跟 {result.get('in_session_with', '某人')} 通话)")

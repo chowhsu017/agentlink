@@ -163,8 +163,12 @@ class SecureSessionManager:
                 decrypted = self.cipher.decrypt(raw_bytes)
             else:
                 # 尝试对 payload 做 base64 解码后解密
+                # 兼容 encrypt_payload 的 "🔒{b64}" 前缀（on_data 需剥掉 🔒 前缀再解码）
                 try:
-                    encrypted = _unb64(payload)
+                    _p = payload
+                    if isinstance(_p, str) and _p.startswith("🔒"):
+                        _p = _p[1:]
+                    encrypted = _unb64(_p)
                     decrypted = self.cipher.decrypt(encrypted)
                 except Exception:
                     pass

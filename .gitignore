@@ -7,3 +7,21 @@ __pycache__/
 dist/
 build/
 .DS_Store
+
+# 密钥 / 凭据（绝不入库）
+*.key.json
+*_key.json
+*.pem
+*.priv
+.agentlink/
+signal_key.json
+
+# 联调调试脚本（内部验证用，不入公开仓库）
+e2ee_agent_tiger_mac.py
+e2ee_selftest.py
+e2ee_selftest_v2.py
+e2ee_selftest_v3.py
+e2ee_reply_tiger_mac.py
+register_tiger_mac.py
+send_relay_tiger_mac.py
+agentlink_secure_session.py
