@@ -2,7 +2,26 @@
 
 本文件记录 AgentLink 各版本的重要变更。版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [v0.1.3] - 2026-08-30
+## [v0.1.4] - 2026-08-30
+
+> 针对协议可信性的三项加固（状态机 / 异步并发 / 不变量断言）。目标：从"能跑"到"可信"——堵住静默明文降级、占位符 DID 不对称、async 回调丢协程三类隐性风险。
+
+### 🛡️ 新增（3 项加固）
+
+- **协议状态机文档**：新增 `docs/协议状态机.md`，对齐 WebRTC SDP 握手思想（offer/answer/ice-candidate），定义 `IDLE/CALLING/RINGING/IN_SESSION` 离散状态、消息↔合法状态映射、加密协商中"谁该有公钥 / 谁该有 salt / 谁该有真实 DID"的权威归属，及 5 条协议不变量。
+- **回调统一 await**：新增 `_maybe_await()` 辅助，所有 `on_ring/on_accept/on_data/on_hangup` 回调显式声明为 `Awaitable | None`，调用处统一安全 await——**修复 `on_accept` 原本同步调用未 await、async 回调静默不执行的遗留 bug**。
+- **三重不变量断言 + 静默降级防护**：
+  - `_peer_from_ctx`：加密路径前断言 `_call_context` 已 set（防"全仓无人赋值 → 一直明文"）。
+  - `encrypt_payload`：加密前断言 `peer_did` 已解析为真实值（非 `placeholder` / 非 `did:wba:` 占位符），防 AEAD 关联数据不对称。
+  - `on_data`：断言入站帧 `🔒` 前缀 ⟷ 本端 `e2ee_enabled` 一致，防前缀收发不对称。
+  - 无 cipher / 明确文降级时打印醒目标记 `⚠️⚠️ 明文发送（不安全）`，绝不静默。
+
+### 🧪 验证
+
+- 新增 `e2ee_assert_test.py`：故意违反三个不变量，确认断言全部触发（有效而非摆设）。
+- 回归 `e2ee_selftest_v3.py`：正常跨机占位符场景加密往返依旧全通，断言未误伤正常链路。
+
+---
 
 > 本次版本源于一台 Mac 与另一台 Mac 的真实局域网联调。E2EE 跨机加密通话 + 跨机资源调用（"远程调用对端本地能力"）首次实证跑通，并修复了联调中暴露的 5 个协议缺陷。
 

@@ -79,6 +79,10 @@ class SecureSessionManager:
     def _peer_from_ctx(self) -> tuple:
         """从 context 提取对端公钥和 DID，兼容不同 key 名"""
         _ctx = getattr(self.state, '_call_context', {})
+        # 不变量断言 #1：call_context 必须在加密前已 set
+        # （否则一直拿空 dict → 明文降级且不报错 → AgentLink 曾踩的静默降级坑）
+        if self.e2ee_enabled or self.cipher is not None:
+            assert _ctx, "call_context must be set before encrypt"
         enc_b64 = _ctx.get("enc_public_b64", "")
         sign_b64 = _ctx.get("sign_public_b64", "")
         did = _ctx.get("caller_did", _ctx.get("did", ""))
@@ -103,7 +107,9 @@ class SecureSessionManager:
             self.e2ee_enabled = True
             print(f"  🔐 {self.state.name}: 加密会话已建立 (→ {peer_did})")
         else:
-            print(f"  ⚠️ {self.state.name}: 对方未提供加密公钥，通信不加密")
+            # ⚠️ 静默明文降级 —— 必须是显式、带告警的，绝不静默
+            print(f"  ⚠️⚠️ {self.state.name}: 对方未提供加密公钥，通信将<b>明文降级</b>（不安全）")
+            print(f"        _call_context={getattr(self.state, '_call_context', {})}")
 
         if self._ring_hook:
             await self._ring_hook(caller_name, session_id)
@@ -158,6 +164,13 @@ class SecureSessionManager:
         """
         decrypted = None
 
+        # 不变量断言 #3：前缀 ↔ 加密一致性
+        # 入站帧以 🔒 开头 ⇒ 发送端加密了；本端 e2ee_enabled 则期望加密。二者必须一致。
+        has_enc_prefix = isinstance(payload, str) and payload.startswith("🔒")
+        assert has_enc_prefix == self.e2ee_enabled, \
+            (f"prefix/encryption invariant broken: frame_encrypted={has_enc_prefix}, "
+             f"session enabled={self.e2ee_enabled} (seq={seq})")
+
         if self.cipher and self.e2ee_enabled:
             if raw_bytes:
                 decrypted = self.cipher.decrypt(raw_bytes)
@@ -195,7 +208,15 @@ class SecureSessionManager:
     def encrypt_payload(self, plaintext: str) -> str:
         """加密出站数据"""
         if not self.cipher or not self.e2ee_enabled:
+            # ⚠️ 明文降级 —— 显式告警，绝不静默（AgentLink 曾踩：_call_context 无人赋值导致一直明文）
+            print(f"  ⚠️⚠️ {self.state.name}: 无 cipher/未启用加密，出站数据<b>明文发送</b>（不安全）")
             return plaintext
+        # 不变量断言 #2：DID 必须在 encrypt 前已解析（不能用占位符），否则 AEAD 绑定错
+        # 占位符形态: 字面量 "placeholder" 或 "did:wba:IP-port"（p1.py 875 行 replace 而来）
+        peer_did = self.state.peer_did or getattr(self.state, '_peer_did', '')
+        _is_ph = (not peer_did) or peer_did == "placeholder" or peer_did.startswith("did:wba:")
+        assert not _is_ph, \
+            f"DID must be resolved before ring, got placeholder: {peer_did!r}"
         encrypted = self.cipher.encrypt(plaintext.encode("utf-8"))
         encrypted_b64 = _b64(encrypted)
         return f"🔒{encrypted_b64}"

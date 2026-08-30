@@ -7,7 +7,7 @@ P2 — 频道模式 + Presence
 from __future__ import annotations
 import asyncio, json, uuid, time, struct
 from dataclasses import dataclass, field
-from typing import Optional, Callable
+from typing import Optional, Callable, Awaitable
 from enum import Enum
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, HTMLResponse
@@ -97,6 +97,20 @@ class SessionRecord:
         }
 
 
+async def _maybe_await(fn: Optional[Callable[..., Awaitable | None]], *args):
+    """安全调用一个可能同步、可能异步的回调。
+
+    原则：回调显式声明为 `Awaitable | None`。若回调是 async（返回 awaitable），
+    必须先 await 再继续——否则协程被丢弃，回调静默不执行（AgentLink 曾踩此坑）。
+    """
+    if fn is None:
+        return None
+    r = fn(*args)
+    if hasattr(r, "__await__"):
+        return await r
+    return r
+
+
 class AgentLinkState:
     """单 agent 完整状态"""
 
@@ -137,11 +151,12 @@ class AgentLinkState:
         self.history: list[SessionRecord] = []
         self._history_lock = asyncio.Lock()
 
-        # 回调注册
-        self.on_data: Optional[Callable] = None   # data(payload, seq, type)
-        self.on_ring: Optional[Callable] = None   # ring(caller, session_id)
-        self.on_accept: Optional[Callable] = None # accept()
-        self.on_hangup: Optional[Callable] = None # hangup(reason)
+        # 回调注册 —— 显式声明为 `Awaitable | None`，回调可以是 async 或同步
+        # 原则：调用处必须安全 await（见 _maybe_await），否则 async 回调静默不执行
+        self.on_data: Optional[Callable[..., Awaitable | None]] = None   # data(payload, seq, type)
+        self.on_ring: Optional[Callable[..., Awaitable | None]] = None   # ring(caller, session_id)
+        self.on_accept: Optional[Callable[..., Awaitable | None]] = None # accept()
+        self.on_hangup: Optional[Callable[..., Awaitable | None]] = None # hangup(reason)
 
         # E2EE：secure 管理器（initiator 发 call 时从中取加密公钥）
         self.secure: Optional["SecureSessionManager"] = None
@@ -423,10 +438,8 @@ def create_agent_app(state: AgentLinkState):
         }
 
         if state.on_ring:
-            # on_ring 可能是 async（secure.on_ring）——await 它
-            r = state.on_ring(caller_name, session_id)
-            if hasattr(r, "__await__"):
-                await r
+            # on_ring 可能是 async（secure.on_ring）——统一 _maybe_await，避免协程被丢弃
+            await _maybe_await(state.on_ring, caller_name, session_id)
 
         # E2EE: ring 响应回传 responder 的加密公钥 + salt + 真实 peer_did，
         # 供 initiator 复用派生 cipher（peer_did 用于 AD 对称，覆盖 initiator 的占位符 DID）
@@ -471,7 +484,8 @@ def create_agent_app(state: AgentLinkState):
         state._hb_task = asyncio.create_task(_heartbeat_loop(state))
 
         if state.on_accept:
-            state.on_accept()
+            # ⚠️ 修复：原来这里 state.on_accept() 未 await，async 回调静默不执行
+            await _maybe_await(state.on_accept)
 
         return rpc_result({
             "status": "accepted",
@@ -683,10 +697,8 @@ def create_agent_app(state: AgentLinkState):
                         state.tlog("data_tx", f"[auto] {reply_text[:60]}", sid)
                         print(f"  📤 {state.name} [auto] 回复: \"{reply_text[:60]}\"")
                     elif state.on_data:
-                        # on_data 可能是 async（secure.on_data）——await 它，否则加密帧不解密
-                        r = state.on_data(payload, seq, dtype)
-                        if hasattr(r, "__await__"):
-                            await r
+                        # on_data 可能是 async（secure.on_data）——统一 _maybe_await，否则加密帧不解密
+                        await _maybe_await(state.on_data, payload, seq, dtype)
                         # ─── 跨机资源调用：解密后识别命令并执行 ───
                         plain = getattr(state, "_last_decrypted", None)
                         if plain:
