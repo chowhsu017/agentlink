@@ -673,7 +673,8 @@ def create_agent_app(state: AgentLinkState):
                     print(f"  📨 {state.name} [{seq}] 收到: \"{payload[:60]}\"")
                     await websocket.send_json(rpc_result({"status": "ok", "seq": seq}))
 
-                    # 自动回复
+                    # 自动回复 —— ⚠️ 只对明文生效：加密帧（🔒 开头）必须走解密，
+                    # 否则 base64 密文可能碰巧含关键词子串，劫持解密（跨机实测抓出的 bug）
                     auto_replies = {
                         "晚上好": "晚上好！收到你的消息了 😊",
                         "你好": "你好！我在线",
@@ -681,10 +682,12 @@ def create_agent_app(state: AgentLinkState):
                         "hello": "Hello! Alice here",
                     }
                     reply_text = None
-                    for kw, reply in auto_replies.items():
-                        if kw in payload.lower():
-                            reply_text = reply
-                            break
+                    _is_enc = isinstance(payload, str) and payload.startswith("🔒")
+                    if not _is_enc:
+                        for kw, reply in auto_replies.items():
+                            if kw in payload.lower():
+                                reply_text = reply
+                                break
                     if reply_text:
                         reply_seq = state.next_seq()
                         reply_frame = ws_message("agentlink.data", state, {
