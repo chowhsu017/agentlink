@@ -34,7 +34,7 @@ class SignalClient:
 
     async def register(self) -> bool:
         """向信令服务注册本 agent"""
-        from agentlink_secure_session import get_signal_registration_payload
+        from agentlink.secure_session import get_signal_registration_payload
         payload = get_signal_registration_payload(self.secure, self.state, self.signal_http)
         try:
             resp = await self._http.post(f"{self.signal_http}/signal/register", json=payload)
