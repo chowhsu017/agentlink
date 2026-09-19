@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 474" width="900" height="474" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#eef2f7"/>
+    </linearGradient>
+    <linearGradient id="p1" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="p2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#0f172a" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect width="900" height="474" fill="url(#bg)"/>
+
+  <!-- 标题 -->
+  <text x="450" y="36" text-anchor="middle" font-size="21" font-weight="700" fill="#0f172a">AgentLink 架构</text>
+  <text x="450" y="58" text-anchor="middle" font-size="12.5" fill="#64748b">Agent-to-Agent 实时通信协议 · 七原语完整会话生命周期</text>
+
+  <!-- 外框 -->
+  <rect x="30" y="76" width="840" height="352" rx="14" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" filter="url(#sh)"/>
+
+  <!-- P1 会话层（距框顶 28px） -->
+  <rect x="56" y="104" width="788" height="96" rx="9" fill="url(#p1)"/>
+  <text x="450" y="132" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">会话层 (P1)</text>
+  <text x="450" y="155" text-anchor="middle" font-size="12.5" fill="#ffffff">call_req → ring → accept → data → hangup</text>
+  <text x="450" y="176" text-anchor="middle" font-size="12" fill="#e8f1ff">heartbeat · timeline · history — 完整会话生命周期，不是一问一答</text>
+
+  <!-- P2 频道层 -->
+  <rect x="56" y="212" width="788" height="80" rx="9" fill="url(#p2)"/>
+  <text x="450" y="240" text-anchor="middle" font-size="15" font-weight="700" fill="#ffffff">频道 &amp; Presence (P2)</text>
+  <text x="450" y="263" text-anchor="middle" font-size="12.5" fill="#ffffff">ChannelRelay · PresenceFederator · 订阅 / 广播 / 会员管理</text>
+  <text x="450" y="283" text-anchor="middle" font-size="11.5" fill="#f0e8ff">多 Agent 群组协作 + 在线状态发现</text>
+
+  <!-- 三大基石（距框底 28px，与顶部对称） -->
+  <rect x="56" y="304" width="248" height="96" rx="9" fill="url(#core)"/>
+  <text x="180" y="331" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">身份 (DID)</text>
+  <text x="180" y="353" text-anchor="middle" font-size="12" fill="#ffffff">Ed25519 签名</text>
+  <text x="180" y="372" text-anchor="middle" font-size="12" fill="#eafaef">DID 凭证 / 去中心化</text>
+  <text x="180" y="392" text-anchor="middle" font-size="11" fill="#d3f7e6">谁在说话，可验证</text>
+
+  <rect x="326" y="304" width="248" height="96" rx="9" fill="url(#core)"/>
+  <text x="450" y="331" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">加密 (E2EE)</text>
+  <text x="450" y="353" text-anchor="middle" font-size="12" fill="#ffffff">X25519 + ChaCha20</text>
+  <text x="450" y="372" text-anchor="middle" font-size="12" fill="#eafaef">Poly1305 认证加密</text>
+  <text x="450" y="392" text-anchor="middle" font-size="11" fill="#d3f7e6">服务端看不到内容</text>
+
+  <rect x="596" y="304" width="248" height="96" rx="9" fill="url(#core)"/>
+  <text x="720" y="331" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">信令 (发现)</text>
+  <text x="720" y="353" text-anchor="middle" font-size="12" fill="#ffffff">REST + WebSocket</text>
+  <text x="720" y="372" text-anchor="middle" font-size="12" fill="#eafaef">SQLite 持久化</text>
+  <text x="720" y="392" text-anchor="middle" font-size="11" fill="#d3f7e6">离线缓存，上线即推送</text>
+
+  <!-- 底部说明 -->
+  <text x="450" y="450" text-anchor="middle" font-size="12.5" font-weight="600" fill="#334155">跨平台 · 纯 Python · MIT 许可证 · macOS / Linux / Windows</text>
+</svg>
