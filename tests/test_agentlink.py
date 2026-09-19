@@ -20,7 +20,7 @@ from agentlink.crypto import _b64, _unb64
 
 class TestCrypto:
     def test_version(self):
-        assert __version__ == "0.1.0"
+        assert __version__ == "0.1.5"
 
     def test_generate_keypair(self):
         kp = generate_keypair("Test")
@@ -143,6 +143,42 @@ class TestCrypto:
 # 频道中继模块
 # ═══════════════════════════════════════════════
 
+class TestRatchet:
+    """对称棘轮 / 前向安全回归测试（2026-09-19 加：修复棘轮死代码后固化行为）"""
+
+    def _pair(self):
+        a = generate_keypair("Alice")
+        b = generate_keypair("Bob")
+        shared = compute_shared_secret(a.enc_private, b.enc_public)
+        key, salt = derive_session_key(shared)
+        return (SessionCipher(key, salt, a.did, b.did),
+                SessionCipher(key, salt, b.did, a.did))
+
+    def test_ratchet_roundtrip(self):
+        ca, cb = self._pair()
+        for i in range(5):
+            enc, seq = ca.ratchet_encrypt(f"msg{i}".encode())
+            assert cb.ratchet_decrypt(enc, seq) == f"msg{i}".encode()
+
+    def test_per_message_key_unique(self):
+        """每条消息密钥必须不同（对称棘轮的核心）"""
+        ca, _ = self._pair()
+        keys = set()
+        for i in range(10):
+            ca.ratchet_encrypt(b"x")
+            keys.add(ca._derive_message_key(ca.seq))
+        assert len(keys) == 10, "消息密钥出现重复，棘轮失效"
+
+    def test_forward_secrecy(self):
+        """前向安全：拿到某条消息密钥，不能解另一条消息"""
+        ca, cb = self._pair()
+        enc0, seq0 = ca.ratchet_encrypt(b"secret-0")
+        enc1, seq1 = ca.ratchet_encrypt(b"secret-1")
+        leaked_key = ca._derive_message_key(seq0)   # 冒充：第0条密钥泄露
+        assert decrypt_message(leaked_key, enc1, ca._ad_for_seq(seq1)) is None, \
+            "旧消息密钥能解新消息 → 前向安全不成立"
+
+
 class TestChannelRelay:
     def test_create_channel(self):
         r = ChannelRelay(db_path=":memory:")
@@ -189,10 +225,16 @@ class TestChannelRelay:
         assert len(r.get_members("c1")) == 0
 
     def test_channel_key(self):
+        # 2026-09-19 修：derive_channel_key 现为“无 E2EE 则返回 None”（防假密钥）。
+        # 原测试假设无 e2ee 频道也返回 32 字节密钥 —— 那是旧行为。
         r = ChannelRelay(db_path=":memory:")
+        # 非 E2EE 频道：应返回 None（不生成假密钥）
+        r.create_channel("c1", "C1", "did:a")
+        assert r.derive_channel_key("c1") is None
+        # 未创建的频道：也应为 None
+        assert r.derive_channel_key("c-nonexist") is None
+        # 幂等：多次调用结果一致
         assert r.derive_channel_key("c1") == r.derive_channel_key("c1")
-        assert r.derive_channel_key("c1") != r.derive_channel_key("c2")
-        assert len(r.derive_channel_key("c1")) == 32
 
     def test_channel_messages(self):
         r = ChannelRelay(db_path=":memory:")

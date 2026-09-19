@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentlink"
-version = "0.1.0"
+version = "0.1.5"
 description = "Agent-to-Agent 实时通信协议 — 会话生命周期 + E2EE + 频道 + Presence"
 readme = "README.md"
 license = { text = "MIT" }

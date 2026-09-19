@@ -182,7 +182,16 @@ class SecureSessionManager:
                     if isinstance(_p, str) and _p.startswith("🔒"):
                         _p = _p[1:]
                     encrypted = _unb64(_p)
-                    decrypted = self.cipher.decrypt(encrypted)
+                    # 2026-09-19：先试对称棘轮解密（与发送端 ratchet_encrypt 配对），
+                    # 失败再回退普通解密（兼容旧对端/旧数据）。
+                    try:
+                        decrypted = self.cipher.ratchet_decrypt(encrypted, seq)
+                    except Exception:
+                        decrypted = None
+                    if decrypted is None:
+                        decrypted = self.cipher.decrypt(encrypted, seq)
+                        if decrypted is not None:
+                            print(f"  ⚠️ {self.state.name}: 棘轮解密未命中，回退普通解密 [{seq}]")
                 except Exception:
                     pass
         else:
@@ -217,7 +226,17 @@ class SecureSessionManager:
         _is_ph = (not peer_did) or peer_did == "placeholder" or peer_did.startswith("did:wba:")
         assert not _is_ph, \
             f"DID must be resolved before ring, got placeholder: {peer_did!r}"
-        encrypted = self.cipher.encrypt(plaintext.encode("utf-8"))
+        # 2026-09-19：启用对称棘轮（每条消息独立密钥）→ 单条密钥泄露不牵连其他消息。
+        # 背景：此前 ratchet_encrypt/decrypt 虽已实现但零调用点（死代码），
+        #       实际用的是 cipher.encrypt()，无任何棘轮 → 前向安全性不足。
+        # 用对称棘轮 = 改动最小、无需改握手、两侧对称。
+        try:
+            encrypted, self._last_seq = self.cipher.ratchet_encrypt(plaintext.encode("utf-8"))
+        except AttributeError:
+            # 兼容旧 cipher（无棘轮方法）→ 回退普通加密（并告警）
+            print(f"  ⚠️ {self.state.name}: cipher 无棘轮方法，回退普通加密")
+            encrypted = self.cipher.encrypt(plaintext.encode("utf-8"))
+            self._last_seq = None
         encrypted_b64 = _b64(encrypted)
         return f"🔒{encrypted_b64}"
 
