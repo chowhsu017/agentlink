@@ -20,7 +20,7 @@ from agentlink.crypto import _b64, _unb64
 
 class TestCrypto:
     def test_version(self):
-        assert __version__ == "0.1.5"
+        assert __version__ == "0.3.0"
 
     def test_generate_keypair(self):
         kp = generate_keypair("Test")

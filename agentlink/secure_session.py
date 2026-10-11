@@ -56,6 +56,12 @@ class SecureSessionManager:
         self._ring_hook = None
         self._accept_hook = None
         self._data_hook = None
+        self._node_ref = None       # 绑定的 AgentLinkNode（账本同步用）
+        # ── v0.2 会话账本 ──────────────────────────────
+        self.ledger = None          # SessionLedger；会话建立时创建
+        self._frame_seq_in = 0      # 已记录入站帧数
+        self._frame_seq_out = 0     # 已记录出站帧数
+        self._is_initiator = True   # v0.3 C1：本端角色（sig_object 定序用）
 
     # ─── 公钥导出 ───
 
@@ -111,18 +117,73 @@ class SecureSessionManager:
             print(f"  ⚠️⚠️ {self.state.name}: 对方未提供加密公钥，通信将<b>明文降级</b>（不安全）")
             print(f"        _call_context={getattr(self.state, '_call_context', {})}")
 
+        self._start_ledger(session_id, peer_did, peer_sign_b64, is_initiator=False)
+
         if self._ring_hook:
             await self._ring_hook(caller_name, session_id)
+
+    # ─── v0.2 账本：会话建立（v0.3 C2：规范化字段）───
+    def _start_ledger(self, session_id: str, peer_did: str, peer_sign_b64: str,
+                      is_initiator: Optional[bool] = None):
+        """会话建立时起一本账本 + 记握手事件。失败不阻断通信（审计不能拖垮会话）。
+
+        v0.3 C2：
+          · initiator/responder 两端写**同一套**（发起方 DID / 响应方 DID）
+          · 握手 nonce/fpr 统一取**发起方**视角
+        """
+        # lazy finalize：若上一个账本还没封存（responder 无显式 hangup 钩子），先封存它
+        if self.ledger is not None:
+            try:
+                self.finalize_ledger(reason="superseded_by_new_session")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from .ledger import SessionLedger
+            role = self._is_initiator if is_initiator is None else is_initiator
+            self._is_initiator = role
+            # C2：两端写同一套 DID（发起方在前）
+            if role:
+                init_did, resp_did = self.kp.did, (peer_did or "")
+            else:
+                init_did, resp_did = (peer_did or ""), self.kp.did
+            # C2：握手 nonce/fpr 统一取发起方视角（发起方产生 nonce；两侧记同一值）
+            nonce = getattr(self.state, '_did_nonce', "") if role \
+                else getattr(self.state, '_peer_did_nonce', getattr(self.state, '_did_nonce', ""))
+            peer_fpr = "sha256:" + (peer_sign_b64[:16] if peer_sign_b64 else "")
+            _ldir = getattr(self, "_ledger_dir_override", None)
+            _lkw = {"ledger_dir": _ldir} if _ldir else {}
+            self.ledger = SessionLedger(
+                session_id=session_id or "unknown",
+                initiator=init_did,
+                responder=resp_did,
+                channel="ws",
+                peer_name=self.state.name,
+                **_lkw,
+            )
+            self.ledger._is_initiator_view = role
+            self.ledger.record_handshake(
+                kex="X25519", cipher="ChaCha20-Poly1305", sig="Ed25519",
+                did_verified=bool(peer_did),
+                nonce=nonce,
+                peer_fpr=peer_fpr,
+            )
+            self._frame_seq_in = 0
+            self._frame_seq_out = 0
+            self._sync_ledger_to_node()
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ {self.state.name}: 账本初始化失败（不阻断通信）: {e}")
+            self.ledger = None
 
     async def on_accept(self):
         """接受方——用 ring 阶段已建立的 cipher，或从 peer 取盐"""
         # 如果 ring 时已建立 cipher，直接复用（responder 路径）
         if self.cipher:
+            # responder 路径：账本已在 on_ring 里建（is_initiator=False）
             if self._accept_hook:
                 await self._accept_hook()
             return
 
-        # initiator 路径：从 ring 响应中拿到的 salt
+        # initiator（呼叫方）路径：从 ring 响应中拿到的 salt
         stored_salt = getattr(self.state, '_session_salt', None)
         peer_enc_b64, peer_sign_b64, peer_did = self._peer_from_ctx()
 
@@ -151,6 +212,13 @@ class SecureSessionManager:
             self.state._peer_enc_public = peer_enc
             self.e2ee_enabled = True
             print(f"  ⚠️ {self.state.name}: 加密会话已建立 (→ {peer_did}) [降级: 无共享 salt]")
+
+        # v0.3：initiator（呼叫方）也要建账本（is_initiator=True）
+        # 之前此路径只建 cipher 不建账本 → 呼叫方无审计记录（v0.2 遗留缺口）
+        if peer_enc_b64 and peer_sign_b64:
+            sid = getattr(self.state, "session_id", "") or "unknown"
+            if self.ledger is None and sid != "unknown":
+                self._start_ledger(sid, peer_did, peer_sign_b64, is_initiator=True)
 
         if self._accept_hook:
             await self._accept_hook()
@@ -184,6 +252,17 @@ class SecureSessionManager:
                     encrypted = _unb64(_p)
                     # 2026-09-19：先试对称棘轮解密（与发送端 ratchet_encrypt 配对），
                     # 失败再回退普通解密（兼容旧对端/旧数据）。
+                    # ┌─ LEDGER 接入点 ②：降级记录（v0.2 · 本设计的灵魂）─────────────
+                    # │ ⚠️ 10-09 那行「棘轮解密未命中，回退普通解密」就在下面这个分支。
+                    # │ 必须在此处写一条带 downgrade_class 的帧事件：
+                    # │   ledger.record_frame(direction="in", enc="plain",
+                    # │       cipher_suite="ChaCha20-Poly1305", decrypt="fallback_plain",
+                    # │       downgrade=True, reason=_classify_reason(...), payload=encrypted)
+                    # │ reason 取值见 ledger.DOWNGRADE_CLASS_MAP：
+                    # │   local_state_mismatch / reordered_frame / unexpected_cipher_change /
+                    # │   ratchet_desync_prolonged / plaintext_downgrade / signature_verify_failed
+                    # │ 同时正常命中分支（下方 decrypted is not None）也要记一条（H4 全量）。
+                    # └──────────────────────────────────────────────────────────────
                     try:
                         decrypted = self.cipher.ratchet_decrypt(encrypted, seq)
                     except Exception:
@@ -192,6 +271,17 @@ class SecureSessionManager:
                         decrypted = self.cipher.decrypt(encrypted, seq)
                         if decrypted is not None:
                             print(f"  ⚠️ {self.state.name}: 棘轮解密未命中，回退普通解密 [{seq}]")
+                            # ── 接入点②（灵魂）：降级记录 v0.2 ──
+                            # reason 的细分：当前代码只能区分“棘轮未命中”，
+                            # 归为 noise 级 local_state_mismatch（大概率正常）。
+                            # 后续若要区分 reordered/desync，需在 cipher 层暴露更多信息。
+                            self._record_frame(direction="in", enc="plain",
+                                               decrypt="fallback_plain", downgrade=True,
+                                               reason="local_state_mismatch", payload=encrypted)
+                    else:
+                        # H4 全量：正常命中也要记一条
+                        self._record_frame(direction="in", enc="ratchet",
+                                           decrypt="ok", downgrade=False, payload=encrypted)
                 except Exception:
                     pass
         else:
@@ -213,6 +303,37 @@ class SecureSessionManager:
 
         if self._data_hook:
             await self._data_hook(plaintext, seq, dtype)
+
+    def _record_frame(self, *, direction: str, enc: str, decrypt: str,
+                      downgrade: bool, reason: str = "", payload=None):
+        """接入点②的统一入口。H4：正常/降级帧都记。失败不阻断通信。
+
+        v0.3 C2：把 in/out 归一为**发送方 DID**（两端对同一帧一致）。
+          · out = 本端发出 → sender = 本端 DID
+          · in  = 对端发出 → sender = 对端 DID
+        """
+        if self.ledger is None:
+            return
+        try:
+            if direction == "in":
+                self._frame_seq_in += 1
+            else:
+                self._frame_seq_out += 1
+            # C2 归一：发送方 DID（回落到 self/peer）
+            led = self.ledger
+            if direction == "out":
+                sender = led.responder if getattr(led, "_is_initiator_view", True) is False \
+                    else led.initiator
+            else:
+                sender = led.initiator if getattr(led, "_is_initiator_view", True) is False \
+                    else led.responder
+            self.ledger.record_frame(
+                sender=sender or ("self" if direction == "out" else "peer"),
+                enc=enc, cipher_suite="ChaCha20-Poly1305",
+                decrypt=decrypt, downgrade=downgrade, reason=reason, payload=payload,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ {self.state.name}: 账本记帧失败（不阻断）: {e}")
 
     def encrypt_payload(self, plaintext: str) -> str:
         """加密出站数据"""
@@ -266,6 +387,84 @@ class SecureSessionManager:
     def is_secure(self) -> bool:
         return self.e2ee_enabled and self.cipher is not None
 
+    # ─── v0.2 账本 → node 桥接（H1 签名交换）───
+    def bind_node(self, node) -> None:
+        """
+        把签名密钥与账本访问权交给 AgentLinkNode，供会话结束时封存+签名交换。
+
+        用法（在创建 node 后调一次）：
+            node = AgentLinkNode(...)
+            secure.bind_node(node)
+        """
+        try:
+            node._sign_keypair = self.kp
+            # 把账本挂到 node：node 在 _do_hangup 里读 self.ledger
+            node.ledger = self.ledger
+            # 会话建立后账本会新建 → 通过回调同步给 node
+            self._node_ref = node
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ bind_node 失败: {e}")
+
+    def _sync_ledger_to_node(self):
+        node = getattr(self, "_node_ref", None)
+        if node is not None:
+            node.ledger = self.ledger
+
+    # ─── v0.2 账本：无 node 场景下的自封存（如 responder 脚本）───
+    async def on_hangup(self, reason: str = "session_end", *args, **kwargs):
+        """
+        挂到 state.on_hangup 的会话结束回调（p1 会在会话断开时调用）。
+        responder 脚本用法：state.on_hangup = secure.on_hangup
+        职责：会话一断，立即封存账本（不依赖下次 on_ring 的 lazy finalize）。
+        """
+        self.finalize_ledger(reason=f"hangup:{reason}")
+
+    def finalize_ledger(self, reason: str = "session_end") -> Optional[str]:
+        """
+        会话结束时封存账本（不依赖 AgentLinkNode）。
+        适用：只用 create_secure_agent（state+secure）、无 node 的 responder。
+        签名交换需 node/WS 信道，此处仅做：record_close + seal + save（单签）。
+        返回 ledger_hash 或 None。
+        """
+        led = self.ledger
+        if led is None:
+            return None
+        # v0.3：若已通过 WS 完成双签交换（ledger 已封存），不再单签覆盖
+        if getattr(led, "_sealed", False):
+            self.ledger = None
+            return led.ledger_hash
+        try:
+            led.record_close(reason=reason)
+            # 本端链尾 hash
+            h_self = led.events[-1].hash
+            # 我方签名（若有 keypair）
+            my_sig = None
+            try:
+                from .crypto import sign_message
+                my_sig = sign_message(self.kp.sign_private, h_self.encode()).hex()
+            except Exception as e:  # noqa: BLE001
+                print(f"  ⚠️ {self.state.name}: 账本签名失败: {e}")
+            # 无 node/WS → 无法交换对端 hash → 单签（sig_object 待对端 hash 到齐方定）
+            led.record_signature_exchange(
+                initiator_sig_received=False, responder_sig_received=False,
+                self_hash=h_self or "", peer_hash="",
+                is_initiator=getattr(self, "_is_initiator", True),
+            )
+            ledger_hash = led.seal()
+            # v0.3：按角色安放本端签名（单签场景）
+            if getattr(self, "_is_initiator", True):
+                led.attach_signatures(initiator_sig=my_sig or "", responder_sig="")
+            else:
+                led.attach_signatures(initiator_sig="", responder_sig=my_sig or "")
+            led.save()
+            print(f"  📒 {self.state.name}: 账本已封存 (hash={ledger_hash[:16]}…, 降级={led.downgrade_count}, 单签)")
+            return ledger_hash
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ {self.state.name}: 账本封存失败: {e}")
+            return None
+        finally:
+            self.ledger = None
+
 
 # ═══════════════════════════════════════════════
 # 便捷工厂
@@ -298,6 +497,11 @@ def create_secure_agent(name: str, port: int,
 
     state = AgentLinkState(name=name, port=port, did=actual_did)
     secure = SecureSessionManager(state, keypair=kp)
+    # 修复：state.did 必须与 crypto 身份 (secure.kp.did) 一致。
+    # 否则 ring 响应会回传 name-based DID（did:agentlink:name），
+    # 而 AEAD 关联数据 (AD) 用的是 kp.did（did:agentlink:name:<random>），
+    # 两侧 AD 不对称 → 跨机解密必失败（对应历史缺陷 #4 的回归）。
+    state.did = secure.kp.did
 
     return state, secure
 

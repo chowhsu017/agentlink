@@ -16,12 +16,25 @@ build/
 .agentlink/
 signal_key.json
 
-# 联调调试脚本（内部验证用，不入公开仓库）
-e2ee_agent_tiger_mac.py
+# 联调调试脚本 / 内部集成脚本（不入公开仓库）
+e2ee_agent_local.py
 e2ee_selftest.py
 e2ee_selftest_v2.py
 e2ee_selftest_v3.py
-e2ee_reply_tiger_mac.py
-register_tiger_mac.py
-send_relay_tiger_mac.py
+e2ee_reply_local.py
+register_local.py
+send_relay_local.py
 agentlink_secure_session.py
+
+# 内部集成 / 联调（含对端主机名、私钥路径、内网 IP，绝不入库）
+agentlink_peers.json
+agentlink_call_*.py
+agentlink_resource_server.py
+notify_*.py
+capability_service.py
+send_interactive.py
+keepalive_resource_server.sh
+e2ee_cross_machine_verify.py
+e2ee_assert_test.py
+e2e_loopback_test.py
+*.bak-*

@@ -6,7 +6,7 @@
 > 七个原语搞定完整会话生命周期：呼叫 → 振铃 → 接受 → 数据帧 → 心跳 → 频道 → 挂断。  
 > 端到端加密、去中心化身份（DID）、信令发现、离线缓存，全都有。
 
-**版本**: 0.1.0 · **MIT 许可证**  
+**版本**: 0.3.0 · **MIT 许可证**  
 **跨平台**: macOS / Linux / Windows — 纯 Python，到哪都能跑
 
 ---
@@ -308,7 +308,7 @@ relay.broadcast("dev-team", "did:alice", "部署完成，请检查！")
 **服务端/执行端**（例如有素材库、算力、脚本的那台）：
 ```bash
 # 启动完整 agent：HTTP + WS 端点 + 注册信令 + 保持在线
-python e2ee_agent_tiger_mac.py            # 或你自己的 agent 应用
+python my_agent_app.py            # 或你自己的 agent 应用
 # capability_service.py 注册了对端发来的命令处理（@search → 本地检索 → 加密回传）
 ```
 

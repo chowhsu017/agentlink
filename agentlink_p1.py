@@ -725,6 +725,56 @@ def create_agent_app(state: AgentLinkState):
                             except Exception as e:
                                 print(f"  ⚠️ {state.name}: 能力处理异常: {e}")
 
+                elif method == "ledger_sig":
+                    # v0.3 C1：会话账本两轮签名交换（responder 侧）
+                    #   轮①：对方发来 hash → 回本端 hash
+                    #   轮②：对方发来 sig  → 用双方 hash 算 sig_object、签名、回传
+                    sec = getattr(state, "secure", None)
+                    led = getattr(sec, "ledger", None) if sec is not None else None
+                    if led is None:
+                        await websocket.send_json(rpc_error(-1, "no ledger"))
+                        continue
+                    rnd = body.get("round", "")
+                    from agentlink.ledger import compute_sig_object
+                    from agentlink.crypto import sign_message as _sign
+                    h_self = led.events[-1].hash if led.events else ""
+                    if rnd == "hash":
+                        led._pending_peer_hash = body.get("ledger_hash", "")
+                        await websocket.send_json(rpc_result({
+                            "type": "ledger_sig", "round": "hash",
+                            "ledger_hash": h_self,
+                        }))
+                        print(f"  📒 {state.name}: ledger_sig 轮① 回 hash {h_self[:16]}…")
+                    elif rnd == "sig":
+                        peer_hash = getattr(led, "_pending_peer_hash", "")
+                        is_init = getattr(led, "_is_initiator_view", False)
+                        sig_object = compute_sig_object(h_self, peer_hash, is_initiator=is_init)
+                        my_sig = ""
+                        try:
+                            my_sig = _sign(sec.kp.sign_private, sig_object.encode()).hex()
+                        except Exception as e:  # noqa: BLE001
+                            print(f"  ⚠️ {state.name}: 账本签名失败: {e}")
+                        # 落账本（
+                        led.record_signature_exchange(
+                            initiator_sig_received=True, responder_sig_received=True,
+                            self_hash=h_self, peer_hash=peer_hash, is_initiator=is_init)
+                        led.seal()
+                        if is_init:
+                            led.attach_signatures(initiator_sig=my_sig,
+                                                  responder_sig=body.get("sig", ""))
+                        else:
+                            led.attach_signatures(initiator_sig=body.get("sig", ""),
+                                                  responder_sig=my_sig)
+                        try:
+                            led.save()
+                        except Exception as e:  # noqa: BLE001
+                            print(f"  ⚠️ {state.name}: 账本落盘失败: {e}")
+                        await websocket.send_json(rpc_result({
+                            "type": "ledger_sig", "round": "sig",
+                            "sig_object": sig_object, "sig": my_sig,
+                        }))
+                        print(f"  📒 {state.name}: ledger_sig 轮② 回签名；sig_obj={sig_object[:20]}…")
+
                 elif method == "agentlink.heartbeat":
                     state._hb_missed = 0
                     state.tlog("hb", "收到心跳", meta.get("session_id", ""))
@@ -801,6 +851,15 @@ def create_agent_app(state: AgentLinkState):
         except WebSocketDisconnect:
             state.tlog("ws_close", f"WebSocket 断开", session_id)
             print(f"  ⚠️ {state.name}: WebSocket 断开 (session={session_id[:8]}...)")
+            # v0.2: WS 断开是会话结束的确定信号 → 立即封存账本
+            # （responder 无 node，不能依赖 _reset_session；此处直接走 secure）
+            _sec = getattr(state, "secure", None)
+            if _sec is not None and getattr(_sec, "ledger", None) is not None:
+                try:
+                    import asyncio as _aio
+                    _aio.ensure_future(_sec.on_hangup("ws_disconnect", session_id))
+                except Exception as _e:  # noqa: BLE001
+                    print(f"  ⚠️ {state.name}: 账本封存调度失败: {_e}")
         except Exception as e:
             print(f"  ⚠️ {state.name}: WebSocket 错误: {e}")
         finally:

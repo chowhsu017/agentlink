@@ -16,6 +16,7 @@ P1→P2 升级:
 基于 P1 agentlink_p1.py — 完整的 P1+P2 融合版本。
 """
 from __future__ import annotations
+import hashlib
 import asyncio, json, uuid, time, os, subprocess
 from dataclasses import dataclass
 from typing import Optional, Callable, Any, Dict, Set
@@ -25,7 +26,6 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 import httpx
 
-# ─── 簿记埋点（opt-in）──────────────────────────────
 # 环境变量 AGENTLINK_BOOKKEEP=1 启用外部簿记脚本
 
 _bookkeep_script = os.environ.get("AGENTLINK_BOOKKEEP_SCRIPT", "")
@@ -43,7 +43,6 @@ def _bookkeep(cmd: str, *args):
         pass
 
 
-# ─── 数据模型 ─────────────────────────────────────
 
 @dataclass
 class SessionRecord:
@@ -60,7 +59,6 @@ class SessionRecord:
     status: str = "spawned"
 
 
-# ─── ChannelHub ───────────────────────────────────
 
 class ChannelHub:
     """
@@ -110,9 +108,43 @@ class ChannelHub:
                     delivered += 1
                 except Exception:
                     pass
+
+        self._audit(channel_id=channel_id, sender=sender, msg=msg, delivered=delivered)
+
         if delivered > 0:
             print(f"  📢 [{sender}] 频道 {channel_id} → {delivered} 个订阅者")
         return delivered
+
+    def _audit(self, channel_id: str, sender: str, msg, delivered: int) -> None:
+        """把广播写入通信审计表（只追加，agent 不可改）。
+
+        与 signal.py 的 comm_audit 表共用同一个 DB。
+        """
+        try:
+            import sqlite3, time, json as _json, os as _os
+            db = _os.environ.get("AGENTLINK_SIGNAL_DB") or _os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)), "agentlink_signal.db")
+            if not _os.path.exists(db):
+                return  # 信令库未初始化，静默跳过
+            try:
+                blob = _json.dumps(msg, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            except Exception:
+                blob = str(msg).encode("utf-8", "ignore")
+            conn = sqlite3.connect(db)
+            try:
+                conn.execute(
+                    "INSERT INTO comm_audit "
+                    "(ts, kind, sender_did, target_did, channel_id, payload_len, msg_hash, delivered) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (time.time(), "broadcast", sender, None, channel_id,
+                     len(blob), hashlib.sha256(blob).hexdigest()[:32],
+                     1 if delivered > 0 else 0),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass  # 审计失败不得影响主链路
 
     async def set_presence(self, node_id: str, info: dict):
         async with self._lock:
@@ -127,7 +159,6 @@ class ChannelHub:
             self._presence.pop(node_id, None)
 
 
-# ─── WsAdapter ─────────────────────────────────────
 
 class WsAdapter:
     """统一封装 websockets-client 和 FastAPI WebSocket"""
@@ -169,7 +200,6 @@ class WsAdapter:
         return self._raw
 
 
-# ─── AgentLinkNode (P2 enhanced) ──────────────────
 
 class AgentLinkNode:
     HEARTBEAT_INTERVAL = 30
@@ -223,7 +253,14 @@ class AgentLinkNode:
         self.on_message: Optional[Callable] = None
         self.on_state_change: Optional[Callable] = None
 
-    # ─── 状态 ───
+        # ── v0.2 会话账本 + 签名交换 ──（v0.3 C1：增 _is_initiator）
+        self.ledger = None                    # SessionLedger
+        self._sign_keypair = None             # AgentKeyPair（对 sig_object 签名）
+        self._peer_sign_public: Optional[bytes] = None
+        self._pending_ledger_sig: Optional[dict] = None
+        self._ledger_sig_event: Optional[asyncio.Event] = None
+        self._is_initiator: bool = True       # v0.3：本端角色（sig_object 定序用）
+
 
     def to_json(self):
         return {
@@ -240,7 +277,6 @@ class AgentLinkNode:
         self.seq += 1
         return self.seq
 
-    # ─── 频道操作 ───
 
     async def subscribe_channel(self, channel_id: str):
         """订阅频道（HTTP 模式，无需 ws 连接）"""
@@ -260,7 +296,6 @@ class AgentLinkNode:
         }
         return await self._channel_hub.broadcast(channel_id, msg, self.name)
 
-    # ─── 心跳 / Reader / Sender / 重连 / 呼叫 / 挂断 ───
     # （P1 逻辑不变，此处省略注释相同的代码）
 
     async def _cleanup(self):
@@ -300,7 +335,101 @@ class AgentLinkNode:
         self._should_reconnect = False
         await self._do_hangup(reason)
 
+    # ─── v0.2 账本封存 + 签名交换（H1）───
+    async def _finalize_ledger(self, reason: str):
+        """
+        会话结束时封存账本并发起签名交换（v0.3 C1：两轮）。
+
+        两轮交换：
+          ① 先互换【本端链尾 hash】
+          ② 各自用双方 hash 算出同一 sig_object，再互换【对 sig_object 的签名】
+        （签名对象依赖双方 hash，故必须两轮；超时=单签，审计不挂死会话）
+        """
+        led = self.ledger
+        if led is None:
+            return
+        try:
+            led.record_close(reason=reason, frames_in=self.frames_received,
+                             frames_out=self.frames_sent)
+            h_self = led.events[-1].hash   # 链尾 hash（sig_exchange 不入链，此处即最终）
+
+            peer_hash = None
+            peer_sig = None
+            my_sig = None
+            if self._ws and self.status == "in_session":
+                try:
+                    # ── 第①轮：互换 hash ──
+                    self._ledger_sig_event = asyncio.Event()
+                    self._pending_ledger_sig = None
+                    await self._ws.send({
+                        "type": "ledger_sig", "round": "hash",
+                        "session_id": self.session_id, "ledger_hash": h_self,
+                    })
+                    try:
+                        await asyncio.wait_for(self._ledger_sig_event.wait(), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        print(f"  ⚠️ {self.name}: 等待对方账本 hash 超时（单签存疑）")
+                    if self._pending_ledger_sig:
+                        peer_hash = self._pending_ledger_sig.get("ledger_hash")
+
+                    # ── 算 sig_object（两端一致） + 本端签名 ──
+                    if peer_hash and self._sign_keypair is not None:
+                        from .crypto import sign_message
+                        from .ledger import compute_sig_object
+                        sig_object = compute_sig_object(
+                            h_self, peer_hash, is_initiator=self._is_initiator)
+                        try:
+                            my_sig = sign_message(self._sign_keypair.sign_private,
+                                                  sig_object.encode("utf-8"))
+                            my_sig = my_sig.hex() if isinstance(my_sig, bytes) else my_sig
+                        except Exception as e:  # noqa: BLE001
+                            print(f"  ⚠️ {self.name}: 账本签名失败: {e}")
+
+                        # ── 第②轮：互换签名 ──
+                        self._ledger_sig_event = asyncio.Event()
+                        self._pending_ledger_sig = None
+                        await self._ws.send({
+                            "type": "ledger_sig", "round": "sig",
+                            "session_id": self.session_id,
+                            "sig_object": sig_object, "sig": my_sig,
+                        })
+                        try:
+                            await asyncio.wait_for(self._ledger_sig_event.wait(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            print(f"  ⚠️ {self.name}: 等待对方账本签名超时（单签存疑）")
+                        if self._pending_ledger_sig:
+                            peer_sig = self._pending_ledger_sig.get("sig")
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ⚠️ {self.name}: 账本签名交换失败: {e}")
+
+            # ③ 记录交换事件（含 sig_object/hash）→ 一次性封存
+            have_peer = peer_sig is not None
+            led.record_signature_exchange(
+                initiator_sig_received=have_peer,
+                responder_sig_received=have_peer,
+                self_hash=h_self or "", peer_hash=peer_hash or "",
+                is_initiator=self._is_initiator,
+            )
+            ledger_hash = led.seal()
+            # v0.3：按**角色**安放签名（我方的签名放自己角色位）
+            if my_sig:
+                if self._is_initiator:
+                    led.attach_signatures(initiator_sig=my_sig, responder_sig=peer_sig or "")
+                else:
+                    led.attach_signatures(initiator_sig=peer_sig or "", responder_sig=my_sig)
+            led.save()
+            ok = bool(my_sig and have_peer)
+            print(f"  📒 {self.name}: 账本已封存 (hash={ledger_hash[:16]}…, "
+                  f"sig_obj={ (led.sig_object or '')[:20] }…, 双签={'齐备' if ok else '不齐'})")
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ {self.name}: 账本封存失败（不影响断开）: {e}")
+        finally:
+            self.ledger = None
+            self._ledger_sig_event = None
+            self._pending_ledger_sig = None
+
     async def _do_hangup(self, reason: str):
+        await self._finalize_ledger(reason)
         d = int(time.time() - self.start_time) if self.start_time else 0
         if self._ws:
             try:
@@ -366,7 +495,12 @@ class AgentLinkNode:
                         return
                     continue
                 mt = msg.get("type", "")
-                if mt == "heartbeat":
+                if mt == "ledger_sig":
+                    # H1：收到对方对 ledger_hash 的签名
+                    self._pending_ledger_sig = msg
+                    if self._ledger_sig_event:
+                        self._ledger_sig_event.set()
+                elif mt == "heartbeat":
                     self._heartbeat_missed = 0
                     self._heartbeat_received += 1
                 elif mt == "data":
@@ -455,6 +589,14 @@ class AgentLinkNode:
         sid = str(uuid.uuid4())
         self.session_id = sid
         self.peer_name = target_name
+        # D3：IPv4 优先（服务端只监听 IPv4；主机名 IPv6-first 会让 websockets 超时）
+        try:
+            from .netutil import prefer_ipv4_url
+            target_ws_url = prefer_ipv4_url(target_ws_url)
+            if target_http_url:
+                target_http_url = prefer_ipv4_url(target_http_url)
+        except Exception:  # noqa: BLE001
+            pass
         self.peer_url = target_http_url or target_ws_url.replace("ws://", "http://").rstrip("/ws")
         self.peer_ws_url = target_ws_url
         self.start_time = time.time()
@@ -522,7 +664,6 @@ class AgentLinkNode:
             return None
 
 
-# ─── FastAPI App (P2 enhanced) ────────────────────
 
 def create_agent_app(node: AgentLinkNode) -> FastAPI:
     app = FastAPI(title=f"AgentLink P2 - {node.name}")
@@ -530,7 +671,6 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
 
     def _body(data): return data.get("params", {}).get("body", {})
 
-    # ─── P1: 信令 ───
 
     @app.post("/agentlink/call")
     async def handle_call(req: Request):
@@ -603,7 +743,6 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
             pass
         print(f"  🔚 {node.name}: ws handler 退出")
 
-    # ─── P2: 频道 ───
 
     @app.post("/agentlink/channel/subscribe")
     async def handle_channel_subscribe(req: Request):
@@ -635,7 +774,6 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
             node.on_message(msg)
         return {"status": "ok"}
 
-    # ─── P2: Presence ───
 
     @app.post("/agentlink/presence/update")
     async def handle_presence_update(req: Request):
@@ -653,7 +791,6 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
     async def handle_presence_get():
         return await hub.get_presence()
 
-    # ─── 状态查询 ───
 
     @app.get("/status")
     async def get_status():

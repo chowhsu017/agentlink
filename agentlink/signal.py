@@ -4,7 +4,7 @@ AgentLink Signaling Server — 轻量信令服务
 依赖：pip install fastapi uvicorn cryptography
 """
 from __future__ import annotations
-import asyncio, json, os, sqlite3, time, uuid
+import asyncio, hashlib, json, os, sqlite3, time, uuid
 from dataclasses import dataclass, field
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -73,6 +73,25 @@ def init_db(db_path: str = DB_PATH):
             created_at REAL DEFAULT 0,
             metadata TEXT DEFAULT '{}'
         )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS comm_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            kind TEXT NOT NULL,
+            sender_did TEXT NOT NULL,
+            target_did TEXT,
+            channel_id TEXT,
+            payload_len INTEGER DEFAULT 0,
+            msg_hash TEXT,
+            delivered INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON comm_audit(ts)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_audit_pair ON comm_audit(sender_did, target_did)
     """)
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_offline_target ON offline_messages(target_did)
@@ -223,6 +242,77 @@ class SignalServer:
         finally:
             conn.close()
 
+    # ─── 通信审计（反合谋可审计性）───
+
+    def audit_comm(self, kind: str, sender_did: str,
+                   target_did: Optional[str] = None,
+                   channel_id: Optional[str] = None,
+                   payload=None, delivered: bool = False) -> None:
+        """记录一次通信事件。只追加，不更新。
+
+        设计原则：
+        - 只存 payload_len 与 msg_hash，**不存明文**（保持 E2EE 语义）
+        - 哈希用于事后验证「这条消息内容有没有被改动」
+        - 写入在服务端，agent 进程无法篡改
+        """
+        if payload is None:
+            blob = b""
+        elif isinstance(payload, (bytes, bytearray)):
+            blob = bytes(payload)
+        else:
+            try:
+                blob = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            except Exception:
+                blob = str(payload).encode("utf-8", "ignore")
+
+        msg_hash = hashlib.sha256(blob).hexdigest()[:32] if blob else None
+
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO comm_audit "
+                "(ts, kind, sender_did, target_did, channel_id, payload_len, msg_hash, delivered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), kind, sender_did, target_did, channel_id,
+                 len(blob), msg_hash, 1 if delivered else 0),
+            )
+            conn.commit()
+        except Exception:
+            pass  # 审计失败不得影响主链路
+        finally:
+            conn.close()
+
+    def audit_recent(self, hours: float = 24.0) -> list[dict]:
+        conn = self._conn()
+        try:
+            since = time.time() - hours * 3600
+            rows = conn.execute(
+                "SELECT ts, kind, sender_did, target_did, channel_id, payload_len, delivered "
+                "FROM comm_audit WHERE ts >= ? ORDER BY ts DESC", (since,)
+            ).fetchall()
+            return [{
+                "ts": r[0], "kind": r[1], "sender": r[2],
+                "target": r[3], "channel": r[4],
+                "payload_len": r[5], "delivered": bool(r[6]),
+            } for r in rows]
+        finally:
+            conn.close()
+
+    def audit_pair_counts(self, hours: float = 24.0) -> list[dict]:
+        """点对点通信计数（用于发现非预期配对）"""
+        conn = self._conn()
+        try:
+            since = time.time() - hours * 3600
+            rows = conn.execute(
+                "SELECT sender_did, target_did, COUNT(*) AS n "
+                "FROM comm_audit "
+                "WHERE ts >= ? AND kind = 'relay' AND target_did IS NOT NULL "
+                "GROUP BY sender_did, target_did ORDER BY n DESC", (since,)
+            ).fetchall()
+            return [{"sender": r[0], "target": r[1], "count": r[2]} for r in rows]
+        finally:
+            conn.close()
+
     def get_agent_enc_key(self, did: str) -> Optional[str]:
         """获取 agent 的加密公钥（用于端到端加密离线消息）"""
         conn = self._conn()
@@ -367,6 +457,39 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
         msgs = signal.get_offline_msgs(did)
         return {"count": len(msgs), "messages": msgs}
 
+    @app.get("/signal/audit")
+    async def api_audit(hours: float = 24.0):
+        """通信审计：最近 N 小时的通信记录 + 点对点计数 + 合谋信号
+
+        注意：返回的是**元数据**（谁和谁、多少条、内容哈希），不含明文。
+        """
+        recent = signal.audit_recent(hours=hours)
+        pairs = signal.audit_pair_counts(hours=hours)
+
+        # ── 合谋信号：非预期配对 ──
+        # 判据：某对 agent 的通信量显著高于同批次的均值
+        anomalies = []
+        if pairs:
+            counts = [p_["count"] for p_ in pairs]
+            avg = sum(counts) / len(counts)
+            for p_ in pairs:
+                if avg > 0 and p_["count"] >= max(3, avg * 3):
+                    anomalies.append({
+                        "sender": p_["sender"], "target": p_["target"],
+                        "count": p_["count"],
+                        "ratio_vs_avg": round(p_["count"] / avg, 2),
+                        "note": "非预期配对：通信量显著高于均值",
+                    })
+
+        return {
+            "window_hours": hours,
+            "total_events": len(recent),
+            "pair_count": len(pairs),
+            "anomalies": anomalies,
+            "pairs_top": pairs[:20],
+            "recent": recent[:100],
+        }
+
     @app.get("/signal/status")
     async def api_status():
         """服务状态"""
@@ -442,6 +565,14 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
                                     "payload": payload,
                                 }
                             })
+                            # ── 审计：转发成功 ──
+                            signal.audit_comm(
+                                kind="relay",
+                                sender_did=agent_did or "unknown",
+                                target_did=target_did,
+                                payload=payload,
+                                delivered=True,
+                            )
                             await ws.send_json({
                                 "result": "relayed",
                                 "params": {"target_did": target_did},
@@ -455,6 +586,13 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
                                 target_did, agent_did or "unknown",
                                 "relay", json.dumps(payload),
                             )
+                            signal.audit_comm(
+                                kind="offline",
+                                sender_did=agent_did or "unknown",
+                                target_did=target_did,
+                                payload=payload,
+                                delivered=False,
+                            )
                             await ws.send_json({
                                 "result": "offlined",
                                 "params": {"target_did": target_did},
@@ -464,6 +602,13 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
                         signal.store_offline_msg(
                             target_did, agent_did or "unknown",
                             "relay", json.dumps(payload),
+                        )
+                        signal.audit_comm(
+                            kind="offline",
+                            sender_did=agent_did or "unknown",
+                            target_did=target_did,
+                            payload=payload,
+                            delivered=False,
                         )
                         await ws.send_json({
                             "result": "offlined",

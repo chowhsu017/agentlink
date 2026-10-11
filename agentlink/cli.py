@@ -51,6 +51,73 @@ def cmd_serve(args):
     uvicorn.run(app, host=host, port=port, log_level=args.log_level or "warning")
 
 
+def cmd_ledger(args):
+    """会话账本查询（v0.2 起，v0.3 增 sig_object 展示）"""
+    from agentlink.ledger import SessionLedger, DEFAULT_LEDGER_DIR
+    d = args.dir or DEFAULT_LEDGER_DIR
+
+    if args.action == "list":
+        if not os.path.isdir(d):
+            print(f"（无账本目录：{d}）")
+            return
+        files = sorted(f for f in os.listdir(d) if f.endswith(".jsonl"))
+        if not files:
+            print(f"（{d} 下暂无账本）")
+            return
+        print(f"账本目录：{d}\n{'SESSION_ID':<40} {'降级':>4}  双签")
+        print("-" * 60)
+        for f in files:
+            sid = f[:-6]
+            try:
+                led = SessionLedger.load(sid, d)
+                has_peer = bool(led.signatures.get("responder"))
+                has_me = bool(led.signatures.get("initiator"))
+                sig = "齐备" if (has_me and has_peer) else "不齐"
+                print(f"{sid:<40} {led.downgrade_count:>4}  {sig}")
+            except Exception as e:  # noqa: BLE001
+                print(f"{sid:<40}  [读取失败: {e}]")
+        return
+
+    if not args.session_id:
+        print("用法：agentlink ledger show <session_id>  （或 verify）")
+        sys.exit(2)
+
+    try:
+        led = SessionLedger.load(args.session_id, d)
+    except FileNotFoundError:
+        print(f"找不到账本：{d}/{args.session_id}.jsonl")
+        sys.exit(1)
+
+    if args.action == "verify":
+        # 注意：CLI 无对方的公钥，只能校「哈希链 + 双签齐备」；真实验签需调用方提供公钥
+        r = led.verify(verifier=None)
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        sys.exit(0 if r["ok"] else 1)
+
+    # show：人类可读 + 内联哈希链校验
+    print(f"📒 会话账本 {led.session_id}")
+    print(f"   发起方: {led.initiator}")
+    print(f"   响应方: {led.responder}")
+    print(f"   频道:   {led.channel}   开始: {led.started_at}")
+    print(f"   降级:   {led.downgrade_count}  {led.downgrade_count_by_class}")
+    print(f"   哈希:   {led.ledger_hash}")
+    if led.sig_object:
+        print(f"   签名对象: {led.sig_object}  （v0.3 双方共签）")
+        print(f"   对端哈希: {led.peer_hash}")
+    print(f"   双签:   发起={bool(led.signatures.get('initiator'))}  响应={bool(led.signatures.get('responder'))}")
+    print("-" * 70)
+    for e in led.events:
+        flag = ""
+        if e.type == "frame" and e.detail.get("downgrade"):
+            flag = f"  🔴 DOWNGRADE[{e.detail.get('downgrade_class')}] {e.detail.get('downgrade_reason')}"
+        enc = e.detail.get("enc", "")
+        print(f"[{e.seq:>3}] {e.ts}  {e.type:<18} enc={enc}{flag}")
+    print("-" * 70)
+    r = led.verify(verifier=None)
+    print(f"完整性: {'✅ 通过' if r['ok'] else '❌ ' + r['reason']}")
+    print(f"（提示：真实签名验证需调用方提供双方公钥；CLI 只能校哈希链+双签齐备）")
+
+
 def cmd_keygen(args):
     """生成密钥对"""
     from agentlink import generate_keypair, save_keypair
@@ -234,6 +301,14 @@ def main():
     p_ch.add_argument("--limit", type=int, default=20, help="历史消息条数 (history)")
     p_ch.add_argument("--db", help="数据库路径")
     p_ch.set_defaults(func=cmd_channel)
+
+    # ledger（v0.2 会话账本）
+    p_led = sub.add_parser("ledger", help="会话账本查询（v0.2）")
+    p_led.add_argument("action", choices=["show", "list", "verify"],
+                       help="show=查一本账本，list=列出已有账本，verify=双签校验")
+    p_led.add_argument("session_id", nargs="?", help="账本 session_id（show/verify 必填）")
+    p_led.add_argument("--dir", help="账本目录（默认 ~/.agentlink/ledgers）")
+    p_led.set_defaults(func=cmd_ledger)
 
     # help
     sub.add_parser("help").set_defaults(func=lambda _: parser.print_help())

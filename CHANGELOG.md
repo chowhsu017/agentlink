@@ -2,6 +2,73 @@
 
 本文件记录 AgentLink 各版本的重要变更。版本遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+> **版本口径**：里程碑 `v0.3`（文档/CHANGELOG 叫法）↔ 包版本号 `0.3.0`（semver，`pyproject.toml` /
+> `agentlink.__version__`）↔ 会话账本数据结构 `ledger_version=1.2`。三者对应关系以本条为准。
+
+## [v0.3.0] - 2026-10-12
+
+> 主题：**跨机账本一致性**——让双方签**同一个**签名对象。
+
+### 🐛 修复（关键）
+
+- **H1 签名交换跨机结构性失效**：v0.2 让两端各建一本账本、各签【自己的】 hash，
+  而两本账本因视角不同天然不同（`initiator/responder/ts/direction/帧数` 等）→
+  `H_A ≠ H_B` 几乎必然 → 跨机诚实会话双签校验**必然失败**（假阴性，误判 tampered）。
+  本版定义**唯一签名对象**：`sig_object = sha256(H_initiator_view ‖ H_responder_view)`
+  （按会话角色定序，非本地视角）→ 两端算出同一对象 → 双签才真正成立。
+- **签名按角色安放**：`my_sig` 必须放本端角色槽（响应方放 `responder` 槽），
+  否则响应方验签必败。
+
+### ✨ 新增
+
+- **C1 双本拼接签名对象**（`compute_sig_object()`）：跨机双签从假阴性变成真有效。
+- **C3 防分叉落地**：`verify()` 用「本端 hash + 对方 hash」重算 `sig_object` 并比对——
+  任一 hash 被改即暴露（v0.2 的对方 `ledger_hash` 字段收到即弃，防分叉是纸面条款）。
+- **C2 规范三字段**：① `initiator/responder` 两端写同一套 ② `direction` → **发送方 DID**
+  ③ 握手 `nonce/fpr` 统一取发起方视角。
+- **两轮签名交换**：先互发链尾 hash，再互发对 `sig_object` 的签名（`node._finalize_ledger`）。
+- `<sid>.sig` 增 `sig_object` / `self_hash` / `peer_hash` / `role_order`。
+- CLI `ledger show` 增 `sig_object` / 对端哈希展示。
+
+### ✅ 测试
+
+- 新增 5 项 v0.3 断言（验证 A/B/C/D + 落盘往返）+ 1 项真实 Ed25519 两轮交换 E2E。
+- **46 passed**（v0.2 为 40），零破坏。
+- 对照复现脚本：`tests/repro_cross_machine_ledger_mismatch.py`（v0.2 缺陷 vs v0.3 修复）。
+
+### 🌐 真机跨机回归（验证 A，2026-10-12）
+
+- 对端机 B（`peer-b`）同步升级 v0.3（4 文件 + `agentlink_p1.py` 增 `ledger_sig` handler）后重启 responder。
+- **一次诚实会话：两端 `sig_object` 相同、双签齐备、真实 Ed25519 交叉验签通过**。
+- 关键证据：`sig_object = sha256:f46739e1…`（双方一致）；降级 0。
+- 对端机 B 侧的 `agentlink_p1.py` 新增了 WS `ledger_sig` 两轮交换 handler。
+
+### 🧩 D3 修复：IPv6/IPv4 双栈兼容（2026-10-12）
+**问题**：服务端 uvicorn 绑 `0.0.0.0`（只 IPv4）；macOS 对 `.local` 主机名 IPv6-first →
+`websockets.connect(主机名)` 首试 IPv6 → 对端无监听 → **5s 超时**（httpx 有回退所以侥幸能连）。
+
+**修法**：新增 `agentlink/netutil.py` 的 `prefer_ipv4_url()`，在所有出站连接点把 host 解析为 IPv4：
+- `agentlink_call_peer.py` / `agentlink_responder_call.py`（替换 ad-hoc `_force_ipv4`）
+- `agentlink/node.py` `call()`（peer WS + HTTP 一并归一）
+- 逃生开关 `AL_PREFER_IPV6=1`（未来双栈环境）；`AL_NET_DEBUG=1` 打印解析
+
+**实测**：主机名连接 **5.0s 超时 → 0.028s**（快 ~178 倍）；发起方→响应方 与 响应方→发起方 **双向均通**。
+**新增测试**：`tests/test_netutil.py`（7 项）。**53 passed**（原 46）。
+
+### 🔧 补：initiator 路径建账本（2026-10-12）
+
+- 修 v0.2 遗留缺口：`on_accept()` 的 initiator（呼叫方）路径之前只建 cipher、不建账本。
+- 现在呼叫方也会建账本（`is_initiator=True`）+ 记帧 + 封存。
+- 新增测试 `test_v03_initiator_accept_creates_ledger`。**54 passed**（原 53）。
+
+### ⚠️ 诚实说明
+
+- 本版只修「跨机账本一致性」。**未解决**：私钥泄露、交换信道被劫持、
+  被审计代码自报（需独立见证，P2）；**暂缓**：Merkle/外部锚定（P1）。
+- 「验证 A（诚实跨机会话通过）」需**对端同步升级 v0.3** 才能跑真机。
+
+---
+
 ## [v0.1.5] - 2026-09-19
 
 > 主题：**把"死代码"变成"活能力"** + **诚实标注问题空间**。
