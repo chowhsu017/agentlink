@@ -24,12 +24,61 @@ import os
 import socket
 import urllib.parse as _up
 
-__all__ = ["prefer_ipv4_url", "resolve_ipv4", "prefer_ipv4_host"]
+__all__ = ["prefer_ipv4_url", "resolve_ipv4", "prefer_ipv4_host", "detect_tailnet_ip"]
 
 
 def _debug(msg: str):
     if os.environ.get("AL_NET_DEBUG"):
         print(f"  [netutil] {msg}")
+
+
+def detect_tailnet_ip() -> str | None:
+    """探测本机 Tailscale (tailnet) 的 100.x.y.z 地址。
+
+    用途：让 agentlink serve 只绑 tailnet 接口（不暴露给同网段/公网）——
+    对应《家庭多机场景整合设计》§4 的"服务只 bind tailnet 接口"要求。
+
+    探测顺序（稳 → 脆）：
+      1. 环境变量 AL_TAILNET_IP（显式指定，最高优先）
+      2. `tailscale ip -4`（官方/Headscale 客户端都有）
+      3. 遍历本机网卡，找 100.64.0.0/10（CGNAT 段，Tailscale 专用）的 IPv4
+    返回 None = 未检测到（Tailscale 未装/未登录）→ 调用方应报错而非静默绑 0.0.0.0。
+    """
+    # 1. 显式环境变量
+    env_ip = os.environ.get("AL_TAILNET_IP")
+    if env_ip:
+        _debug(f"AL_TAILNET_IP={env_ip}")
+        return env_ip
+    # 2. tailscale ip -4
+    import subprocess
+    for cmd in (["tailscale", "ip", "-4"],
+                ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "ip", "-4"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                ip = r.stdout.strip().splitlines()[0].strip()
+                _debug(f"{' '.join(cmd)} -> {ip}")
+                return ip
+        except Exception as e:  # noqa: BLE001
+            _debug(f"{' '.join(cmd)} 失败: {e}")
+    # 3. 网卡扫描：100.64.0.0/10
+    try:
+        import socket as _s
+        hostname = _s.gethostname()
+        for info in _s.getaddrinfo(hostname, None, family=_s.AF_INET):
+            ip = info[4][0]
+            octets = ip.split(".")
+            if len(octets) == 4 and octets[0] == "100":
+                try:
+                    second = int(octets[1])
+                    if 64 <= second <= 127:  # 100.64.0.0/10
+                        _debug(f"网卡扫描命中 tailnet: {ip}")
+                        return ip
+                except ValueError:
+                    pass
+    except Exception as e:  # noqa: BLE001
+        _debug(f"网卡扫描失败: {e}")
+    return None
 
 
 def resolve_ipv4(host: str, port: int) -> str | None:

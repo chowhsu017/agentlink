@@ -7,9 +7,10 @@
 > 七个原语搞定完整会话生命周期：呼叫 → 振铃 → 接受 → 数据帧 → 心跳 → 频道 → 挂断。  
 > 端到端加密、去中心化身份（DID）、信令发现、离线缓存，全都有。
 
-**版本**: 0.3.1 · **MIT 许可证**  
+**版本**: 0.4.0-dev · **MIT 许可证**  
 **跨平台**: macOS / Linux / Windows — 纯 Python，到哪都能跑  
-**CI**: GitHub Actions 跑 Py3.10/3.11/3.12 矩阵 + 不变量断言（见徽章）
+**CI**: GitHub Actions 跑 Py3.10/3.11/3.12 矩阵 + 不变量断言（见徽章）  
+**定位**: 家庭/局域网多机的 agent 会话层。**传输加密由 WireGuard（Tailscale）提供**；本协议负责会话语义 + 资源调用 + 应用层身份签名。
 
 ---
 
@@ -32,7 +33,11 @@ agentlink keygen my-agent
 
 ## 🔐 安全现状（诚实说明）
 
-> 本项目的安全能力**以代码为准，不以宣传为准**。以下为 v0.1.5 实测状态。
+> 本项目的安全能力**以代码为准，不以宣传为准**。以下为 v0.4-dev 实测状态。
+>
+> ★ **定位声明（v0.4）**：本项目**不自研传输加密**。推荐部署在 **Tailscale/WireGuard** 之类成熟的传输层之上——
+> 传输机密性由该层提供；AgentLink 负责**会话语义 + 应用层身份签名（Ed25519）**。
+> 若你单独部署 AgentLink（不经 WireGuard），请自行为传输层加固。
 
 | 能力 | 状态 | 说明 |
 |:--|:--|:--|
@@ -46,6 +51,7 @@ agentlink keygen my-agent
 | **DID 凭证时效/挑战** | ✅ **已加固**（v0.3.1） | `verify_did_binding` 增时效窗口 + 挑战 nonce（防重放） |
 | **防重放** | ✅ **已加固**（v0.3.1） | `SessionCipher` 单调 seq 接收窗口，同 seq 重放拒解 |
 | 状态机 | ✅ **已加固**（v0.3.1） | `NodeState` 枚举 + 转换表，非法转换抛 `StateError` |
+| **服务只绑 tailnet** | ✅ **已支持**（v0.4-dev） | `agentlink serve --host auto` 只绑 Tailscale 接口，不暴露同网段/公网 |
 | **频道 E2EE** | ❌ **已废除**（v0.3.1） | 原组密钥公开可算（假加密）→ 已移除；频道加密划归 v0.5 路线 |
 | 第三方安全审计 | ❌ 无 | 现有审查均为自审 / LLM 辅助，非专业机构审计 |
 
@@ -53,8 +59,8 @@ agentlink keygen my-agent
 - **无完整前向保密**：缺 DH 棘轮，长期私钥泄露会危及历史消息。
 - **对称棘轮不是真棘轮**：`crypto.py:ratchet_*` 用固定 session_key + 固定 salt 逐消息派生，**链尾密钥从不更新**——单次 session_key 泄露即可回溯解密全会话（v0.3.1 如实标注，勿再称「强前向保密」）。
 - **未经独立审计**：AEAD nonce 管理、HKDF salt、时序安全等未由第三方验证。
-- **P1 部分修**：关键路径的 `except: pass` 已换结构化日志（其余静默仍存）、SQLite 已加 WAL/timeout/锁。**未解决**：DIY 密码学（建议换 Noise/libsignal）、账本哈希链不防合谋截断、DID cert 自签无外部可信锚。
-- **不适合生产敏感数据场景**，请自行评估风险。
+- **P1 部分修**：关键路径的 `except: pass` 已换结构化日志（其余静默仍存）、SQLite 已加 WAL/timeout/锁。**未解决**：DIY 密码学、账本哈希链不防合谋截断（Merkle 设计已存 `docs/P2-2-*`）、DID cert 自签无外部可信锚。
+- **不适合生产敏感数据场景**，请自行评估风险。若部署在 Tailscale/WireGuard 之上，则传输层安全由该层提供。
 
 > 修复记录见 `CHANGELOG.md`；外部评价见 `REVIEWS.md`。
 
@@ -179,11 +185,13 @@ pip install -e ".[full]"
 
 ```bash
 agentlink serve         # 🚀 一键启动完整服务（信令+频道+Presence）
+agentlink connect <对端> # 🔗 一行连接对端（-c "命令" 单发；--check 自检）
 agentlink signal        # 📡 仅启动信令服务（轻量模式）
 agentlink keygen <名>   # 🔑 生成密钥对
 agentlink encrypt       # 🔒 端到端加密消息
 agentlink decrypt       # 🔓 解密消息
 agentlink channel       # 📢 频道管理
+agentlink ledger        # 📒 会话账本查询/校验
 ```
 
 ### `agentlink serve`
@@ -192,6 +200,7 @@ agentlink channel       # 📢 频道管理
 
 ```bash
 agentlink serve --port 9765
+agentlink serve --port 9765 --host auto     # ★ v0.4：只绑 Tailscale tailnet 接口
 
 # 输出：
 # 🚀 AgentLink 服务启动 @ 0.0.0.0:9765
@@ -206,11 +215,41 @@ agentlink serve --port 9765
 | 参数 | 默认值 | 说明 |
 |:------|:-----|:-----|
 | `--port` | 9765 | 监听端口 |
-| `--host` | 0.0.0.0 | 监听地址 |
+| `--host` | 127.0.0.1 | 监听地址；填 `auto` = 自动只绑 **tailnet 接口** |
 | `--db` | ~/.agentlink/signal.db | 信号数据库 |
 | `--key` | ~/.agentlink/signal_key.json | 服务密钥 |
 | `--channel-db` | ~/.agentlink/channels.db | 频道数据库 |
 | `--log-level` | warning | 日志级别 |
+
+### `agentlink connect`（v0.4）
+
+一行连接对端（固化 host/端口/密钥，读 `agentlink_peers.json`）：
+
+```bash
+agentlink connect                   # 列出可用对端
+agentlink connect mac-mini          # 连对端，进交互
+agentlink connect mac-mini -c "@search 刑侦"   # 发一条命令即退出
+agentlink connect mac-mini --check  # 只做连通/握手/双签自检（跑一键回归）
+```
+
+### 一键跨机回归（v0.4）
+
+一条命令跑完整链路（连通→握手→资源调用→双签→**真实验签**→完整性）：
+
+```bash
+python3 agentlink_regression.py <对端> "<命令>"    # 人性化输出
+python3 agentlink_regression.py <对端> -j           # JSON（CI 用）
+# 退出码：0=全过 / 1=有失败 / 2=用法错误
+```
+
+### 部署推荐（家庭/局域网多机）
+
+```bash
+# mini（常驻节点）：只绑 tailnet，不暴露同网段/公网
+agentlink serve --host auto --port 9765
+```
+> 传输加密由 **Tailscale/WireGuard** 提供；AgentLink 在上跑会话语义。
+> 详见 `docs/AgentLink-家庭多机场景整合设计-20261012.md`。
 
 ---
 

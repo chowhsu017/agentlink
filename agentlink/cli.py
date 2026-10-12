@@ -35,6 +35,17 @@ def cmd_serve(args):
     host = args.host or "127.0.0.1"
     port = args.port or 9765
 
+    # T2：--host auto 自动探测 tailnet 接口（只绑 tailnet，不暴露同网段/公网）
+    if host == "auto":
+        from agentlink.netutil import detect_tailnet_ip
+        _tip = detect_tailnet_ip()
+        if not _tip:
+            print("❌ --host auto：未检测到 Tailscale tailnet IP。")
+            print("   请确认：① 装了 Tailscale ② 已登录 ③ 或用 AL_TAILNET_IP=100.x.y.z 显式指定")
+            sys.exit(2)
+        host = _tip
+        print(f"🔒 --host auto → 只绑 tailnet 接口 {host}（同网段/公网不可见）")
+
     print(f"\n🚀 AgentLink 服务启动 @ {host}:{port}")
     print(f"   DID:      {signal.kp.did}")
     print(f"   密钥:     {signal.key_path}")
@@ -49,6 +60,75 @@ def cmd_serve(args):
     print(f"   客户端接入: SignalClient(signal_url='http://{host}:{port}')")
 
     uvicorn.run(app, host=host, port=port, log_level=args.log_level or "warning")
+
+
+def cmd_connect(args):
+    """T1：一行连接对端（固化 host/端口/密钥，交互式发命令）。
+
+    用法：
+      agentlink connect                # 列出可用对端
+      agentlink connect <name>         # 连指定对端，进入交互
+      agentlink connect <name> -c "@search 刑侦"   # 连并发一条命令后退出
+      agentlink connect <name> --check # 只做连通性/握手自检（跑一键回归）
+    """
+    from agentlink.peer_registry import list_peers, resolve_peer
+
+    name = args.peer
+    if not name:
+        peers = list_peers()
+        if not peers:
+            print("（agentlink_peers.json 里暂无对端）")
+            return
+        print("可用对端：")
+        for p in peers:
+            info = resolve_peer(p)
+            print(f"  · {p:<16} [{info.get('net','lan')}] {info.get('http','')}")
+        print("\n用法：agentlink connect <name>")
+        return
+
+    info = resolve_peer(name)
+    if not info.get("http"):
+        print(f"❌ 对端 {name} 未配置（检查 agentlink_peers.json）")
+        sys.exit(2)
+
+    print(f"🔗 连接对端 {name} [{info.get('net','lan')}] {info['http']}")
+
+    # --check：跑一键回归（首选新脚本；没装则回落旧脚本）
+    if getattr(args, "check", False):
+        import subprocess
+        reg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "agentlink_regression.py")
+        if os.path.exists(reg):
+            rc = subprocess.call([sys.executable, reg, name])
+            sys.exit(rc)
+        print("⚠️ 未找到 agentlink_regression.py，改用旧验证脚本")
+        sys.exit(1)
+
+    # -c <cmd>：发一条命令后退出；否则交互
+    cmd = getattr(args, "command", None)
+    call = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        f"agentlink_call_{name.split('-')[0]}.py")
+    # 优先用通用回归脚本发单条命令
+    reg = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "agentlink_regression.py")
+    if not os.path.exists(reg):
+        print("⚠️ 未找到发送脚本（agentlink_regression.py）")
+        sys.exit(1)
+    import subprocess
+    if cmd:
+        rc = subprocess.call([sys.executable, reg, name, cmd])
+        sys.exit(rc)
+    # 交互模式（简易 REPL）
+    print("进入交互模式（空行/exit 退出）：")
+    while True:
+        try:
+            line = input("agentlink> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line or line in ("exit", "quit"):
+            break
+        subprocess.call([sys.executable, reg, name, line])
 
 
 def cmd_ledger(args):
@@ -259,7 +339,8 @@ def main():
     # serve
     p_serve = sub.add_parser("serve", help="启动完整 AgentLink 服务（信令+频道+Presence）")
     p_serve.add_argument("--port", type=int, default=9765, help="端口 (默认 9765)")
-    p_serve.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1)")
+    p_serve.add_argument("--host", default="127.0.0.1",
+                         help="监听地址 (默认 127.0.0.1；填 auto = 自动只绑 tailnet 接口)")
     p_serve.add_argument("--db", help="信号数据库路径 (默认 ~/.agentlink/signal.db)")
     p_serve.add_argument("--key", help="服务密钥路径 (默认 ~/.agentlink/signal_key.json)")
     p_serve.add_argument("--channel-db", help="频道数据库路径 (默认 ~/.agentlink/channels.db)")
@@ -315,6 +396,13 @@ def main():
     p_led.add_argument("--allow-unverified", action="store_true",
                        help="verify 时允许「仅校哈希链+双签齐备、不做真实验签」（默认拒绝）")
     p_led.set_defaults(func=cmd_ledger)
+
+    # connect（T1：一行连接对端）
+    p_con = sub.add_parser("connect", help="一行连接对端（固化 host/端口/密钥）")
+    p_con.add_argument("peer", nargs="?", help="对端名（agentlink_peers.json 里的 key）；省略=列出对端")
+    p_con.add_argument("-c", "--command", help="连接后发一条命令即退出（不填则交互）")
+    p_con.add_argument("--check", action="store_true", help="只做连通性/握手/双签自检（跑一键回归）")
+    p_con.set_defaults(func=cmd_connect)
 
     # help
     sub.add_parser("help").set_defaults(func=lambda _: parser.print_help())

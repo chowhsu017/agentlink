@@ -5,6 +5,34 @@
 > **版本口径**：里程碑 `v0.3`（文档/CHANGELOG 叫法）↔ 包版本号 `0.3.0`（semver，`pyproject.toml` /
 > `agentlink.__version__`）↔ 会话账本数据结构 `ledger_version=1.2`。三者对应关系以本条为准。
 
+## [v0.4-dev] - 2026-10-12（进行中，待 mini 到货验证）
+
+> 主题：**面向家庭多机场景的落地准备**（《AgentLink-家庭多机场景整合设计》施工项）。
+> 定位收敛：从"通用 E2EE 底座"→"家庭/局域网多机 agent 会话层，传输加密由 WireGuard(Tailscale) 提供"。
+> ⚠️ **P2-1（换 Noise/自研 E2EE）已砍掉**（Tailscale 已给传输加密，再套 Noise 重复）。
+
+### ✨ 新增
+
+- **T2 `agentlink serve --host auto`**：自动探测 Tailscale tailnet IP，**只绑 tailnet 接口**（不暴露同网段/公网）。
+  新增 `netutil.detect_tailnet_ip()`（探测顺序：`AL_TAILNET_IP` → `tailscale ip -4` → 网卡扫 100.64.0.0/10）。
+  未检测到 Tailscale 时**报错退出（exit 2）**，不静默绑 0.0.0.0。
+- **T4 `agentlink/peer_registry.py`**：统一对端登记表加载器（支持 `lan`/`tailnet` 两类）；
+  `agentlink_peers.json` 增 `net` 字段 + `mac-mini`（tailnet）示例条目。
+- **T3 `agentlink_regression.py`**：一键跨机回归（连通性→握手→资源调用→双签→**真实验签**→完整性），
+  结构化 pass/fail 输出 + `-j` JSON 模式 + 退出码。
+- **T1 `agentlink connect`**：一行连接对端（`connect` 列出对端 / `connect <name>` 交互 / `-c "命令"` / `--check` 自检）。
+
+### ✅ 验证
+
+- 单测 **74 passed** + 不变量断言 3/3（零破坏）。
+- **真机回归 6/6 全过**（zheng-mac）：连通/握手/加密往返/双签/**真实验签 sig_verified=True**/完整性。
+
+### ⏳ 待 mini 到货
+
+- T2 的"服务只绑 tailnet"要到 mini/笔记本装了 Tailscale 才能真机验。
+- DERP 穿透质量实测（direct vs relay）。
+- `@run <模型任务>` 资源扩展（D-E）。
+
 ## [v0.3.1] - 2026-10-12
 
 > 主题：**真相加固**（源自 Kimi(kimi-k2.6) 测评 + 我方逐条代码核验）。
