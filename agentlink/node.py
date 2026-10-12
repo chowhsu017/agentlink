@@ -19,12 +19,38 @@ from __future__ import annotations
 import hashlib
 import asyncio, json, uuid, time, os, subprocess
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional, Callable, Any, Dict, Set
 from collections import defaultdict
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 import httpx
+
+from .logbook import log
+
+
+class NodeState(str, Enum):
+    """P1-3：节点显式状态机（取代裸字符串）。
+
+    IDLE → RINGING → IN_SESSION → IDLE  （呼叫方/被叫方共用）
+    合法转换见 _TRANSITIONS；非法转换抛 StateError。
+    """
+    IDLE = "idle"
+    RINGING = "ringing"
+    IN_SESSION = "in_session"
+
+
+class StateError(RuntimeError):
+    """非法状态转换。"""
+
+
+# P1-3：允许的状态转换表（from → {to...}）
+_TRANSITIONS = {
+    NodeState.IDLE: {NodeState.RINGING},
+    NodeState.RINGING: {NodeState.IN_SESSION, NodeState.IDLE},
+    NodeState.IN_SESSION: {NodeState.IDLE},
+}
 
 # 环境变量 AGENTLINK_BOOKKEEP=1 启用外部簿记脚本
 
@@ -39,8 +65,8 @@ def _bookkeep(cmd: str, *args):
             ["python3", _bookkeep_script, cmd] + [str(a) for a in args],
             capture_output=True, timeout=3
         )
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        log.debug("bookkeep", "外部簿记脚本调用失败（不影响主链路）", exc=e, cmd=cmd)
 
 
 
@@ -106,8 +132,8 @@ class ChannelHub:
                 try:
                     await c.post(f"{url}/agentlink/channel/on_message", json=msg)
                     delivered += 1
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    log.warn("channel", "广播投递失败", exc=e, channel_id=channel_id, url=url)
 
         self._audit(channel_id=channel_id, sender=sender, msg=msg, delivered=delivered)
 
@@ -125,7 +151,8 @@ class ChannelHub:
             db = _os.environ.get("AGENTLINK_SIGNAL_DB") or _os.path.join(
                 _os.path.dirname(_os.path.abspath(__file__)), "agentlink_signal.db")
             if not _os.path.exists(db):
-                return  # 信令库未初始化，静默跳过
+                log.debug("audit", "信令库未初始化，跳过广播审计", db=db)
+                return
             try:
                 blob = _json.dumps(msg, ensure_ascii=False, sort_keys=True).encode("utf-8")
             except Exception:
@@ -143,8 +170,8 @@ class ChannelHub:
                 conn.commit()
             finally:
                 conn.close()
-        except Exception:
-            pass  # 审计失败不得影响主链路
+        except Exception as e:  # noqa: BLE001
+            log.warn("audit", "广播审计写入失败（不影响主链路）", exc=e, channel_id=channel_id)
 
     async def set_presence(self, node_id: str, info: dict):
         async with self._lock:
@@ -192,8 +219,8 @@ class WsAdapter:
     async def close(self):
         try:
             await self._raw.close()
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.debug("ws", "关闭 WS 连接时异常（忽略）", exc=e)
 
     @property
     def raw(self):
@@ -214,12 +241,13 @@ class AgentLinkNode:
         self.url = f"http://localhost:{port}"
         self.ws_url = f"ws://localhost:{port}/agentlink/ws"
 
-        # 会话状态
+        # 会话状态（P1-3：显式状态机，内部用 NodeState）
         self.session_id: Optional[str] = None
         self.peer_url: Optional[str] = None
         self.peer_name: Optional[str] = None
         self.peer_ws_url: Optional[str] = None
-        self.status: str = "idle"
+        self._state: NodeState = NodeState.IDLE
+        self._state_lock = asyncio.Lock()   # P1-3：转换串行化，防并发双会话
 
         # 连接
         self._ws: Optional[WsAdapter] = None
@@ -261,6 +289,25 @@ class AgentLinkNode:
         self._ledger_sig_event: Optional[asyncio.Event] = None
         self._is_initiator: bool = True       # v0.3：本端角色（sig_object 定序用）
 
+
+    @property
+    def status(self) -> str:
+        """P1-3：对外仍暴露字符串（兼容旧调用方/JSON），内部为 NodeState。"""
+        return self._state.value
+
+    @status.setter
+    def status(self, value):
+        """兼容旧代码直接赋字符串的状态（转成 NodeState，不做事后校验）。"""
+        self._state = value if isinstance(value, NodeState) else NodeState(value)
+
+    def _set_state(self, new: NodeState) -> None:
+        """P1-3：仅允许表中列出的转换，非法抛 StateError。"""
+        new = new if isinstance(new, NodeState) else NodeState(new)
+        allowed = _TRANSITIONS.get(self._state, set())
+        if new != self._state and new not in allowed:
+            raise StateError(
+                f"illegal state transition: {self._state.value} → {new.value}")
+        self._state = new
 
     def to_json(self):
         return {
@@ -338,11 +385,12 @@ class AgentLinkNode:
     # ─── v0.2 账本封存 + 签名交换（H1）───
     async def _finalize_ledger(self, reason: str):
         """
-        会话结束时封存账本并发起签名交换（v0.3 C1：两轮）。
+        会话结束时封存账本并发起签名交换（v0.3 C1：两轮；v0.3.1 P0-2/P0-3 加固）。
 
-        两轮交换：
-          ① 先互换【本端链尾 hash】
+        两轮交换（P0-3：第①轮 hash 也带签名，先验签再采信）：
+          ① 互换【本端链尾 hash + 对该 hash 的签名】→ 先验签，确认 peer_hash 未被中间人替换
           ② 各自用双方 hash 算出同一 sig_object，再互换【对 sig_object 的签名】
+             收到 peer_sig 后用对端 Ed25519 公钥**真实验签**（P0-2，不再是塞进字段就完）
         （签名对象依赖双方 hash，故必须两轮；超时=单签，审计不挂死会话）
         """
         led = self.ledger
@@ -356,30 +404,62 @@ class AgentLinkNode:
             peer_hash = None
             peer_sig = None
             my_sig = None
-            if self._ws and self.status == "in_session":
+            peer_hash_verified = False     # P0-3：peer_hash 是否经签名验证
+            peer_sig_verified = False      # P0-2：peer_sig 是否经真实验签
+            from .crypto import sign_message, verify_message
+            _kp = self._sign_keypair
+            if self._ws and self.status == NodeState.IN_SESSION:
                 try:
-                    # ── 第①轮：互换 hash ──
+                    # ── 第①轮：互换 hash（带签名）──
+                    my_hash_sig = None
+                    if _kp is not None:
+                        try:
+                            my_hash_sig = sign_message(
+                                _kp.sign_private, h_self.encode("utf-8"))
+                            my_hash_sig = my_hash_sig.hex() if isinstance(my_hash_sig, bytes) else my_hash_sig
+                        except Exception as e:  # noqa: BLE001
+                            print(f"  ⚠️ {self.name}: 链尾 hash 签名失败: {e}")
                     self._ledger_sig_event = asyncio.Event()
                     self._pending_ledger_sig = None
                     await self._ws.send({
                         "type": "ledger_sig", "round": "hash",
                         "session_id": self.session_id, "ledger_hash": h_self,
+                        "hash_sig": my_hash_sig,
                     })
                     try:
                         await asyncio.wait_for(self._ledger_sig_event.wait(), timeout=3.0)
                     except asyncio.TimeoutError:
                         print(f"  ⚠️ {self.name}: 等待对方账本 hash 超时（单签存疑）")
                     if self._pending_ledger_sig:
-                        peer_hash = self._pending_ledger_sig.get("ledger_hash")
+                        cand_hash = self._pending_ledger_sig.get("ledger_hash")
+                        cand_sig = self._pending_ledger_sig.get("hash_sig")
+                        # P0-3：必须用对端公钥验 hash 签名，未验签的 peer_hash 不采信
+                        if cand_hash and cand_sig and self._peer_sign_public:
+                            try:
+                                sig_b = bytes.fromhex(cand_sig)
+                            except (ValueError, TypeError):
+                                sig_b = None
+                            if sig_b and verify_message(
+                                    self._peer_sign_public, cand_hash.encode("utf-8"), sig_b):
+                                peer_hash = cand_hash
+                                peer_hash_verified = True
+                            else:
+                                print(f"  ❌ {self.name}: 对方链尾 hash 签名验证失败——丢弃 peer_hash（P0-3）")
+                        elif cand_hash and not self._peer_sign_public:
+                            # 无对端公钥（旧对端/未握手）→ 不采信，防止被替换
+                            print(f"  ⚠️ {self.name}: 无对端签名公钥，peer_hash 不可验签，不采信")
+                        else:
+                            peer_hash = cand_hash  # 兼容旧对端（无 hash_sig 字段）——记警告
+                            if cand_hash:
+                                print(f"  ⚠️ {self.name}: 对端未附 hash 签名（旧协议），peer_hash 未经真实校验")
 
                     # ── 算 sig_object（两端一致） + 本端签名 ──
-                    if peer_hash and self._sign_keypair is not None:
-                        from .crypto import sign_message
+                    if peer_hash and _kp is not None:
                         from .ledger import compute_sig_object
                         sig_object = compute_sig_object(
                             h_self, peer_hash, is_initiator=self._is_initiator)
                         try:
-                            my_sig = sign_message(self._sign_keypair.sign_private,
+                            my_sig = sign_message(_kp.sign_private,
                                                   sig_object.encode("utf-8"))
                             my_sig = my_sig.hex() if isinstance(my_sig, bytes) else my_sig
                         except Exception as e:  # noqa: BLE001
@@ -398,12 +478,31 @@ class AgentLinkNode:
                         except asyncio.TimeoutError:
                             print(f"  ⚠️ {self.name}: 等待对方账本签名超时（单签存疑）")
                         if self._pending_ledger_sig:
-                            peer_sig = self._pending_ledger_sig.get("sig")
+                            cand_sig = self._pending_ledger_sig.get("sig")
+                            cand_obj = self._pending_ledger_sig.get("sig_object")
+                            # P0-2：收到的 peer_sig 必须用对端公钥**真实验签**，且对象一致
+                            if cand_obj and cand_obj != sig_object:
+                                print(f"  ❌ {self.name}: 对方 sig_object 与本端不一致——拒绝（P0-2）")
+                            elif cand_sig and self._peer_sign_public:
+                                try:
+                                    sig_b = bytes.fromhex(cand_sig)
+                                except (ValueError, TypeError):
+                                    sig_b = None
+                                if sig_b and verify_message(
+                                        self._peer_sign_public, sig_object.encode("utf-8"), sig_b):
+                                    peer_sig = cand_sig
+                                    peer_sig_verified = True
+                                else:
+                                    print(f"  ❌ {self.name}: 对方账本签名验证失败——不置双签（P0-2）")
+                            else:
+                                # 无公钥时不采信
+                                print(f"  ⚠️ {self.name}: 无对端公钥，对方签名不可验，不置双签（P0-2）")
                 except Exception as e:  # noqa: BLE001
                     print(f"  ⚠️ {self.name}: 账本签名交换失败: {e}")
 
             # ③ 记录交换事件（含 sig_object/hash）→ 一次性封存
-            have_peer = peer_sig is not None
+            #   P0-2：只有 peer_sig 通过真实验签，才算「双签齐备」
+            have_peer = peer_sig_verified
             led.record_signature_exchange(
                 initiator_sig_received=have_peer,
                 responder_sig_received=have_peer,
@@ -412,15 +511,20 @@ class AgentLinkNode:
             )
             ledger_hash = led.seal()
             # v0.3：按**角色**安放签名（我方的签名放自己角色位）
+            #   P0-2：peer_sig 仅在验签通过时才写入；否则留空（单方出示无效）
             if my_sig:
                 if self._is_initiator:
-                    led.attach_signatures(initiator_sig=my_sig, responder_sig=peer_sig or "")
+                    led.attach_signatures(initiator_sig=my_sig,
+                                          responder_sig=peer_sig if peer_sig_verified else "")
                 else:
-                    led.attach_signatures(initiator_sig=peer_sig or "", responder_sig=my_sig)
+                    led.attach_signatures(initiator_sig=peer_sig if peer_sig_verified else "",
+                                          responder_sig=my_sig)
             led.save()
-            ok = bool(my_sig and have_peer)
+            ok = bool(my_sig and peer_sig_verified)
             print(f"  📒 {self.name}: 账本已封存 (hash={ledger_hash[:16]}…, "
-                  f"sig_obj={ (led.sig_object or '')[:20] }…, 双签={'齐备' if ok else '不齐'})")
+                  f"sig_obj={ (led.sig_object or '')[:20] }…, "
+                  f"peer_hash验签={'✅' if peer_hash_verified else '✗'}, "
+                  f"双签={'齐备(已验)' if ok else '不齐'})")
         except Exception as e:  # noqa: BLE001
             print(f"  ⚠️ {self.name}: 账本封存失败（不影响断开）: {e}")
         finally:
@@ -454,7 +558,7 @@ class AgentLinkNode:
         print(f"\n🔌 {self.name}: 断开 (时长={d}s, tx={self.frames_sent} rx={self.frames_received}, reconn={self._disconnects}, reason={reason})")
         self._log_end(reason)
         await self._cleanup()
-        self.status = "idle"
+        self._set_state(NodeState.IDLE)
         self.session_id = None
         self.peer_url = None
         self.peer_name = None
@@ -465,7 +569,7 @@ class AgentLinkNode:
             self.on_state_change("disconnected", reason)
 
     async def send_data(self, text: str) -> bool:
-        if self.status != "in_session" or not self._ws:
+        if self.status != NodeState.IN_SESSION or not self._ws:
             return False
         seq = self.next_seq()
         try:
@@ -482,7 +586,7 @@ class AgentLinkNode:
 
     async def _reader_loop(self):
         try:
-            while self.status == "in_session" and self._ws:
+            while self.status == NodeState.IN_SESSION and self._ws:
                 try:
                     msg = await asyncio.wait_for(
                         self._ws.recv(), timeout=self.HEARTBEAT_INTERVAL * 1.5
@@ -527,16 +631,16 @@ class AgentLinkNode:
             pass
         except Exception as e:
             print(f"  ⚡ {self.name}: Reader 断开: {type(e).__name__}")
-            if self.status == "in_session" and self.peer_ws_url and self._should_reconnect:
+            if self.status == NodeState.IN_SESSION and self.peer_ws_url and self._should_reconnect:
                 asyncio.create_task(self._reconnect_loop())
-            elif self.status == "in_session":
+            elif self.status == NodeState.IN_SESSION:
                 await self._do_hangup("disconnected")
 
     async def _sender_loop(self):
         try:
-            while self.status == "in_session":
+            while self.status == NodeState.IN_SESSION:
                 await asyncio.sleep(self.HEARTBEAT_INTERVAL)
-                if self.status != "in_session":
+                if self.status != NodeState.IN_SESSION:
                     break
                 try:
                     await self._ws.send({
@@ -644,7 +748,7 @@ class AgentLinkNode:
             print(f"  ❌ ws 连接失败: {e}")
             return False
 
-        self.status = "in_session"
+        self._set_state(NodeState.IN_SESSION)
         self._heartbeat_missed = 0
         self._reader_task = asyncio.create_task(self._reader_loop())
         self._sender_task = asyncio.create_task(self._sender_loop())
@@ -681,10 +785,10 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
         caller_url = body.get("caller_url", "")
         caller_ws = body.get("caller_ws_url", "")
 
-        if node.status == "in_session":
+        if node.status == NodeState.IN_SESSION:
             return {"jsonrpc": "2.0", "result": {"type": "busy", "session_id": sid}}
 
-        node.status = "ringing"
+        node._set_state(NodeState.RINGING)
         node.session_id = sid
         node.peer_url = caller_url
         node.peer_name = caller_name
@@ -698,7 +802,7 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
         sid = _body(await req.json()).get("session_id", "")
         if node.session_id != sid:
             return {"jsonrpc": "2.0", "error": {"code": -1, "message": "session mismatch"}}
-        node.status = "in_session"
+        node._set_state(NodeState.IN_SESSION)
         node._heartbeat_missed = 0
         node._presence_status = "busy"
         await hub.set_presence(node.name, {
@@ -737,7 +841,7 @@ def create_agent_app(node: AgentLinkNode) -> FastAPI:
             node._reader_task = asyncio.create_task(node._reader_loop())
 
         try:
-            while node.status in ("ringing", "in_session") and node._ws:
+            while node.status in (NodeState.RINGING, NodeState.IN_SESSION) and node._ws:
                 await asyncio.sleep(5)
         except asyncio.CancelledError:
             pass

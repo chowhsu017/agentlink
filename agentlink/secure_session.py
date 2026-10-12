@@ -22,6 +22,7 @@ from .crypto import (
     sign_did_binding, verify_did_binding,
     _b64, _unb64,
 )
+from .logbook import log
 
 
 def _maybe_decode(s: str) -> bytes:
@@ -73,11 +74,15 @@ class SecureSessionManager:
             "did": self.kp.did,
         }
 
-    def get_auth_payload(self) -> dict:
-        """附带 DID 绑定凭证"""
+    def get_auth_payload(self, nonce: str = "") -> dict:
+        """附带 DID 绑定凭证。
+
+        P1-5：cert **每次调用现签**（timestamp=当前），否则启动超过时效窗口（300s）后
+        重连/注册会因凭证过期而认证失败。若服务端下发了挑战 nonce，应传入 nonce 一并签名。
+        """
         return {
             **self.get_public_payload(),
-            "cert": sign_did_binding(self.kp),
+            "cert": sign_did_binding(self.kp, nonce=nonce),
         }
 
     # ─── 密钥协商 —— 发起方 ───
@@ -135,8 +140,8 @@ class SecureSessionManager:
         if self.ledger is not None:
             try:
                 self.finalize_ledger(reason="superseded_by_new_session")
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                log.warn("ledger", "lazy finalize 失败", exc=e, session=session_id)
         try:
             from .ledger import SessionLedger
             role = self._is_initiator if is_initiator is None else is_initiator
@@ -171,7 +176,8 @@ class SecureSessionManager:
             self._frame_seq_out = 0
             self._sync_ledger_to_node()
         except Exception as e:  # noqa: BLE001
-            print(f"  ⚠️ {self.state.name}: 账本初始化失败（不阻断通信）: {e}")
+            log.error("ledger", "账本初始化失败（不阻断通信）", exc=e,
+                      session=session_id, peer_did=peer_did)
             self.ledger = None
 
     async def on_accept(self):
@@ -265,7 +271,9 @@ class SecureSessionManager:
                     # └──────────────────────────────────────────────────────────────
                     try:
                         decrypted = self.cipher.ratchet_decrypt(encrypted, seq)
-                    except Exception:
+                    except Exception as e:  # noqa: BLE001
+                        # 棘轮未命中很常见（对端旧版/乱序）——debug 级，不是错误
+                        log.debug("decrypt", "棘轮解密未命中，待回退", exc=e, seq=seq)
                         decrypted = None
                     if decrypted is None:
                         decrypted = self.cipher.decrypt(encrypted, seq)
@@ -282,8 +290,8 @@ class SecureSessionManager:
                         # H4 全量：正常命中也要记一条
                         self._record_frame(direction="in", enc="ratchet",
                                            decrypt="ok", downgrade=False, payload=encrypted)
-                except Exception:
-                    pass
+                except Exception as e:  # noqa: BLE001
+                    log.error("decrypt", "入站帧解密/记录失败（已丢弃该帧）", exc=e, seq=seq)
         else:
             decrypted = payload.encode("utf-8") if isinstance(payload, str) else payload
 
@@ -333,7 +341,7 @@ class SecureSessionManager:
                 decrypt=decrypt, downgrade=downgrade, reason=reason, payload=payload,
             )
         except Exception as e:  # noqa: BLE001
-            print(f"  ⚠️ {self.state.name}: 账本记帧失败（不阻断）: {e}")
+            log.error("ledger", "账本记帧失败（不阻断）", exc=e, direction=direction, seq=seq)
 
     def encrypt_payload(self, plaintext: str) -> str:
         """加密出站数据"""
@@ -403,7 +411,7 @@ class SecureSessionManager:
             # 会话建立后账本会新建 → 通过回调同步给 node
             self._node_ref = node
         except Exception as e:  # noqa: BLE001
-            print(f"  ⚠️ bind_node 失败: {e}")
+            log.error("node", "bind_node 失败（账本将无法回传 node）", exc=e)
 
     def _sync_ledger_to_node(self):
         node = getattr(self, "_node_ref", None)
@@ -443,7 +451,7 @@ class SecureSessionManager:
                 from .crypto import sign_message
                 my_sig = sign_message(self.kp.sign_private, h_self.encode()).hex()
             except Exception as e:  # noqa: BLE001
-                print(f"  ⚠️ {self.state.name}: 账本签名失败: {e}")
+                log.error("ledger", "账本签名失败", exc=e, session=self.state.name)
             # 无 node/WS → 无法交换对端 hash → 单签（sig_object 待对端 hash 到齐方定）
             led.record_signature_exchange(
                 initiator_sig_received=False, responder_sig_received=False,
@@ -460,7 +468,7 @@ class SecureSessionManager:
             print(f"  📒 {self.state.name}: 账本已封存 (hash={ledger_hash[:16]}…, 降级={led.downgrade_count}, 单签)")
             return ledger_hash
         except Exception as e:  # noqa: BLE001
-            print(f"  ⚠️ {self.state.name}: 账本封存失败: {e}")
+            log.error("ledger", "账本封存失败", exc=e, session=self.state.name)
             return None
         finally:
             self.ledger = None

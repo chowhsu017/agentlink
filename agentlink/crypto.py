@@ -123,20 +123,39 @@ def verify_message(sign_public: bytes, message: bytes, signature: bytes) -> bool
     except Exception:
         return False
 
-def sign_did_binding(kp: AgentKeyPair) -> dict:
+def sign_did_binding(kp: AgentKeyPair, nonce: str = "") -> dict:
+    """签发 DID 绑定凭证。
+
+    P1-4/P1-5：可附带服务端下发的 **挑战 nonce**（nonce 入签名 payload），
+    使凭证与一次具体挑战绑定，无法跨连接重放。
+    """
     ts = time.time()
-    payload = _json_bytes({"did": kp.did, "timestamp": ts, "enc_public_b64": _b64(kp.enc_public)})
+    payload = _json_bytes({"did": kp.did, "timestamp": ts,
+                           "enc_public_b64": _b64(kp.enc_public),
+                           "nonce": nonce})
     sig = sign_message(kp.sign_private, payload)
     return {
         "did": kp.did, "sign_public_b64": _b64(kp.sign_public),
         "enc_public_b64": _b64(kp.enc_public), "timestamp": ts,
+        "nonce": nonce,
         "signature_b64": _b64(sig),
     }
 
-def verify_did_binding(cert: dict) -> bool:
-    """验证 DID 绑定凭证：签名有效性 + DID 指纹与 sign_public 绑定"""
-    # 1. 验证签名
-    payload = _json_bytes({"did": cert["did"], "timestamp": cert["timestamp"], "enc_public_b64": cert["enc_public_b64"]})
+DID_BINDING_MAX_AGE = 300  # P1-5：凭证最长有效期（秒），默认 5 分钟
+
+def verify_did_binding(cert: dict, *, expected_nonce: str = "",
+                       max_age: float = DID_BINDING_MAX_AGE,
+                       now: Optional[float] = None) -> bool:
+    """验证 DID 绑定凭证：签名有效性 + DID 指纹绑定 + 时效 + （可选）挑战 nonce。
+
+    P1-5：
+      · 时效：|now - cert.timestamp| 必须 <= max_age（防「永久有效凭证」被无限期重放）
+      · 挑战：若本端下发了 nonce，必须 expected_nonce == cert.nonce（防跨连接重放）
+    """
+    # 1. 验证签名（含 nonce 入签名）
+    payload = _json_bytes({"did": cert["did"], "timestamp": cert["timestamp"],
+                           "enc_public_b64": cert["enc_public_b64"],
+                           "nonce": cert.get("nonce", "")})
     if not verify_message(_unb64(cert["sign_public_b64"]), payload, _unb64(cert["signature_b64"])):
         return False
     # 2. 验证 DID 指纹：DID 最后一个冒号后的 16 字符应 = sign_public_b64 的前 16 字符
@@ -144,6 +163,17 @@ def verify_did_binding(cert: dict) -> bool:
     fp_from_did = did.rsplit(":", 1)[-1] if ":" in did else ""
     fp_from_sign = cert.get("sign_public_b64", "")[:16]
     if fp_from_did and fp_from_sign and fp_from_did != fp_from_sign:
+        return False
+    # 3. P1-5 时效检查
+    try:
+        cert_ts = float(cert.get("timestamp", 0))
+    except (TypeError, ValueError):
+        return False
+    _now = now if now is not None else time.time()
+    if cert_ts <= 0 or abs(_now - cert_ts) > max_age:
+        return False
+    # 4. P1-5 挑战 nonce 检查（调用方传了 expected_nonce 就必须匹配）
+    if expected_nonce and cert.get("nonce", "") != expected_nonce:
         return False
     return True
 
@@ -167,6 +197,9 @@ class SessionCipher:
         self.local_did = local_did
         self.peer_did = peer_did
         self.seq = 0
+        # P1-7：接收窗口，防重放（拒绝重复/过旧的 seq）
+        self._seen_seqs: set = set()
+        self._recv_window = 256
         self._x3dh_ek_private: bytes = b""
         self._peer_ik: bytes = b""
         self._own_enc_private: bytes = b""
@@ -259,6 +292,9 @@ class SessionCipher:
         if seq is None:
             self.seq += 1
             seq = self.seq
+        # P1-7：防重放（仅对显式传入 seq 的入站帧生效；自动递增的自用路径不查）
+        if not self._accept_seq(seq):
+            return None
         return decrypt_message(self.session_key, encrypted, self._ad_for_seq(seq))
 
     def ratchet_encrypt(self, plaintext: bytes) -> Tuple[bytes, int]:
@@ -269,9 +305,24 @@ class SessionCipher:
         return encrypt_message(msg_key, plaintext, self._ad_for_seq(seq)), seq
 
     def ratchet_decrypt(self, encrypted: bytes, seq: int) -> Optional[bytes]:
-        """Symmetric ratchet decrypt with per-message key"""
+        """Symmetric ratchet decrypt with per-message key（P1-7：含防重放）"""
+        if not self._accept_seq(seq):
+            return None
         msg_key = self._derive_message_key(seq)
         return decrypt_message(msg_key, encrypted, self._ad_for_seq(seq))
+
+    def _accept_seq(self, seq: int) -> bool:
+        """P1-7：单调 seq 窗口。
+        返回 True = 该 seq 首次见到、可以解密；False = 已见过（重放）→ 拒绝。
+        超出窗口的极小 seq（明显旧的）一并拒绝；同时清理远旧记录防内存增长。
+        """
+        if seq in self._seen_seqs:
+            return False
+        self._seen_seqs.add(seq)
+        # 清理：只保留最近 _recv_window 个
+        if len(self._seen_seqs) > self._recv_window * 2:
+            self._seen_seqs = set(sorted(self._seen_seqs)[-self._recv_window:])
+        return True
 
     def _derive_message_key(self, seq: int) -> bytes:
         info = f"agentlink-msg-key:seq={seq}".encode()

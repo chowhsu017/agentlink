@@ -10,7 +10,10 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+from .logbook import log
 import uvicorn
 
 # 导入加密模块
@@ -21,6 +24,7 @@ from .crypto import (
     compute_shared_secret, derive_session_key,
     encrypt_message, decrypt_message,
     generate_keypair, save_keypair, load_keypair,
+    verify_message,
     _b64, _unb64,
 )
 
@@ -33,6 +37,10 @@ KEY_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "signal_k
 
 OFFLINE_EXPIRE_SEC = 3600 * 24 * 7  # 离线消息保留 7 天
 HEARTBEAT_TIMEOUT = 60               # 60 秒无心跳 = 离线
+
+# P0-4：DID 签名 Bearer token 的有效期（秒）与时钟容差
+auth_TOKEN_TTL = 120
+auth_CLOCK_SKEW = 30
 
 
 # ─── 数据库 ─────────────────────────────────────
@@ -109,6 +117,9 @@ class SignalServer:
         self.db_path = db_path
         self.key_path = key_path
         self.ws_connections: dict[str, WebSocket] = {}  # did -> ws
+        # P1-4/P1-5：挑战 nonce（HTTP 用 did 作键；WS 用 "__ws__{id(ws)}" 作键）
+        self._challenges: dict[str, dict] = {}
+        self._consumed_challenge_ws: dict[int, str] = {}
 
         # 生成或加载服务端密钥对
         if os.path.exists(key_path):
@@ -124,7 +135,17 @@ class SignalServer:
     # ─── DB helpers ───
 
     def _conn(self):
-        return sqlite3.connect(self.db_path)
+        # P1-2：SQLite 连接不再跨线程/协程共享。
+        #   · check_same_thread=False + 每调用新建连接 → 避免「database is locked」
+        #   · timeout=5 → 突发并发下排队而非立即抛错
+        #   · WAL 模式 → 读写并行，减少锁竞争
+        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+        except Exception as e:  # noqa: BLE001
+            log.debug("db", "设置 WAL/busy_timeout 失败（环境不支持则忽略）", exc=e)
+        return conn
 
     def register_agent(self, did: str, name: str,
                        http_url: str, ws_url: str,
@@ -242,6 +263,76 @@ class SignalServer:
         finally:
             conn.close()
 
+    # ─── P0-4：DID 签名 bear token（挑战-响应式）───
+
+    def issue_challenge(self, did: str) -> str:
+        """为指定 DID 下发一次性挑战 nonce。"""
+        nonce = uuid.uuid4().hex + uuid.uuid4().hex[:8]
+        if not hasattr(self, "_challenges"):
+            self._challenges = {}
+        self._challenges[did] = {"nonce": nonce, "ts": time.time()}
+        return nonce
+
+    def verify_token(self, token: str) -> Optional[str]:
+        """
+        验证 `Authorization: Bearer <token>` 的签名，返回 DID 或 None。
+
+        token 格式：base64url(json).base64url(sig_hex_ascii)
+          json = {"did":..., "ts":..., "nonce":...}
+          sig  = Ed25519 签名（对 `agentlink-auth-v1:` + json 字节）
+        验签公钥从已注册 agent 的 sign_public_b64 取。
+        """
+        try:
+            from .crypto import _unb64
+            body_b64, _, sig_b64 = token.partition(".")
+            if not body_b64 or not sig_b64:
+                return None
+            body = _unb64(body_b64)
+            sig = _unb64(sig_b64)
+            data = json.loads(body.decode("utf-8"))
+            did = data.get("did", "")
+            ts = float(data.get("ts", 0))
+            nonce = data.get("nonce", "")
+            if not did:
+                return None
+            now = time.time()
+            # 时效：ts 必须在 [now-TTL-skew, now+skew] 内
+            if abs(now - ts) > (auth_TOKEN_TTL + auth_CLOCK_SKEW):
+                return None
+            # 一次性 nonce：必须由本服务签发且未过期
+            ch = getattr(self, "_challenges", {}).get(did)
+            if not ch or ch.get("nonce") != nonce:
+                return None
+            # 取注册公钥验签
+            agent = self.find_agent(did)
+            if not agent or not agent.get("sign_public_b64"):
+                return None
+            pub = _unb64(agent["sign_public_b64"])
+            if not verify_message(pub, b"agentlink-auth-v1:" + body, sig):
+                return None
+            # 用掉 nonce（防重放）
+            self._challenges.pop(did, None)
+            return did
+        except Exception as e:  # noqa: BLE001
+            log.warn("auth", "token 验证异常（视为无效）", exc=e)
+            return None
+
+    def _require_admin(self, req: Request) -> bool:
+        """P0-5：审计类接口的访问控制。
+        优先：请求来自本机（127.0.0.1）→ 放行；
+        否则：需 env AGENTLINK_ADMIN_TOKEN 且 header 匹配。
+        """
+        try:
+            client = getattr(req, "client", None)
+            if client is not None and getattr(client, "host", "") in ("127.0.0.1", "::1", "localhost"):
+                return True
+        except Exception as e:  # noqa: BLE001
+            log.debug("auth", "读取 client.host 失败，按非本机处理", exc=e)
+        import os as _os
+        want = _os.environ.get("AGENTLINK_ADMIN_TOKEN", "")
+        got = req.headers.get("X-Admin-Token", "") if req else ""
+        return bool(want) and got == want
+
     # ─── 通信审计（反合谋可审计性）───
 
     def audit_comm(self, kind: str, sender_did: str,
@@ -277,8 +368,8 @@ class SignalServer:
                  len(blob), msg_hash, 1 if delivered else 0),
             )
             conn.commit()
-        except Exception:
-            pass  # 审计失败不得影响主链路
+        except Exception as e:  # noqa: BLE001
+            log.warn("audit", "审计写入失败（不影响主链路）", exc=e, kind=kind)
         finally:
             conn.close()
 
@@ -345,16 +436,16 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
 
     @app.post("/signal/register")
     async def api_register(req: Request):
-        """agent 注册 — 验证 DID 绑定凭证 + enc_public 一致性"""
+        """agent 注册 — 验证 DID 绑定凭证（P1-5：含时效）+ enc_public 一致性"""
         data = await req.json()
         did: str = data.get("did", "")
         cert: dict = data.get("cert", {})
         enc_b64: str = data.get("enc_public_b64", "")
 
-        # 验证 DID 绑定凭证（签名有效性）
+        # 验证 DID 绑定凭证（签名有效性 + P1-5 时效）
         if cert:
             if not verify_did_binding(cert):
-                return {"error": "DID 绑定凭证验证失败"}
+                return {"error": "DID 绑定凭证验证失败（签名/指纹/时效）"}
             if cert.get("did") != did:
                 return {"error": "DID 不匹配"}
             # 额外验证：cert 中的 enc_public 与注册的 enc_public 一致
@@ -442,27 +533,51 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
         )
         return {"message_id": mid}
 
+    @app.post("/signal/auth/challenge")
+    async def api_auth_challenge(req: Request):
+        """P0-4：为指定 DID 下发一次性挑战 nonce（获取签名 token 的第一步）。"""
+        data = await req.json()
+        did = data.get("did", "")
+        if not did:
+            return {"error": "did required"}
+        return {"did": did, "nonce": signal.issue_challenge(did)}
+
     @app.get("/signal/offline_msg/{did}")
     async def api_get_offline(did: str, req: Request):
-        """获取离线消息 — 需 Authorization header 携带 DID 签名"""
-        # 鉴权：检查请求是否带有效 DID 签名 token
+        """获取离线消息 — P0-4：必须携带 **Ed25519 签名**的 Bearer token。
+
+        鉴权流程：
+          ① 客户端 POST /signal/auth/challenge {did} → 拿 nonce
+          ② 客户端构造 body={"did","ts","nonce"}，用私钥签 `agentlink-auth-v1:`+body
+          ③ Authorization: Bearer b64(body).b64(sig)
+          ④ 本接口验签 + 校验时效/一次性 nonce，且 token 内的 did 必须 == 路径 did
+        （旧版「token 就是 DID 字符串」的伪鉴权已废除）
+        """
         auth = req.headers.get("Authorization", "")
         if not auth or not auth.startswith("Bearer "):
-            return {"error": "未授权：需要 Authorization: Bearer <token>"}
-        # 简单校验：token 中包含目标 DID 才允许拉取
-        # 完整方案应使用 DID 签名挑战
-        token_did = auth[7:] if len(auth) > 7 else ""
+            return {"error": "未授权：需要 Authorization: Bearer <signed token>"}
+        token = auth[7:].strip()
+        token_did = signal.verify_token(token)
+        if not token_did:
+            return {"error": "未授权：token 签名无效/过期/已使用"}
         if token_did != did:
             return {"error": "无权拉取其他 DID 的离线消息"}
         msgs = signal.get_offline_msgs(did)
         return {"count": len(msgs), "messages": msgs}
 
     @app.get("/signal/audit")
-    async def api_audit(hours: float = 24.0):
+    async def api_audit(req: Request, hours: float = 24.0):
         """通信审计：最近 N 小时的通信记录 + 点对点计数 + 合谋信号
+
+        P0-5：本接口暴露全站通信元数据（社交图谱/合谋分析），**必须鉴权**：
+          · 本机请求（127.0.0.1）放行
+          · 非本机需 header `X-Admin-Token` == env `AGENTLINK_ADMIN_TOKEN`
 
         注意：返回的是**元数据**（谁和谁、多少条、内容哈希），不含明文。
         """
+        if not signal._require_admin(req):
+            return JSONResponse({"error": "未授权：审计接口仅限本机或管理员"},
+                                status_code=403)
         recent = signal.audit_recent(hours=hours)
         pairs = signal.audit_pair_counts(hours=hours)
 
@@ -506,6 +621,17 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
     async def ws_handler(ws: WebSocket):
         await ws.accept()
         agent_did = None
+        # P1-5：连接建立后先下发一次性挑战 nonce（客户端证明持有 DID 私钥）
+        ws_challenge = signal.issue_challenge(f"__ws__{id(ws)}")
+        signal._consumed_challenge_ws[id(ws)] = ws_challenge
+        try:
+            await ws.send_json({
+                "method": "signal.challenge",
+                "params": {"nonce": ws_challenge,
+                           "note": "请在 signal.auth 的 cert.nonce 中回传此值"},
+            })
+        except Exception as e:  # noqa: BLE001
+            log.warn("auth", "下发 WS 挑战 nonce 失败", exc=e)
 
         try:
             while True:
@@ -518,8 +644,10 @@ def create_signal_app(signal: SignalServer) -> FastAPI:
                     agent_did = body.get("did", "")
                     cert = body.get("cert", {})
 
-                    if cert and not verify_did_binding(cert):
-                        await ws.send_json({"error": "DID 凭证验证失败"})
+                    # P1-5：验证签名/指纹/时效；如果本次 WS 下过 challenge，还须匹配 nonce
+                    exp_nonce = signal._consumed_challenge_ws.get(id(ws), "")
+                    if cert and not verify_did_binding(cert, expected_nonce=exp_nonce):
+                        await ws.send_json({"error": "DID 凭证验证失败（签名/时效/挑战不匹配）"})
                         continue
 
                     signal.register_agent(

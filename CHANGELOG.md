@@ -5,6 +5,65 @@
 > **版本口径**：里程碑 `v0.3`（文档/CHANGELOG 叫法）↔ 包版本号 `0.3.0`（semver，`pyproject.toml` /
 > `agentlink.__version__`）↔ 会话账本数据结构 `ledger_version=1.2`。三者对应关系以本条为准。
 
+## [v0.3.1] - 2026-10-12
+
+> 主题：**真相加固**（源自 Kimi(kimi-k2.6) 测评 + 我方逐条代码核验）。
+> 修的都是「承诺与实现不符」类问题——此前 README/CHANGELOG 声称的能力，代码里其实是空转。
+> 分两批：**P0 止血**（账本/信令/频道诚实化）+ **P1 工程加固**（异常/并发/状态机/nonce/防重放）。
+
+### 🔴 P0 修复
+
+#### 账本真实性
+- **P0-1 `verify()` 可被伪造双签绕过**：`verify(verifier=None)` 时跳过验签但末尾仍 `ok=True`，
+  而 CLI `ledger verify` 正是 `verifier=None` → 填两个非空字符串就报「通过」。
+  现在：未提供 verifier 默认 **不通过**；确需「仅校哈希链」必须显式 `allow_unverified=True`（且结果标注未验签）。
+- **P0-2 对端账本签名从未真实验签**：`_finalize_ledger` 收到 `peer_sig` 直接塞进 responder 槽就记「双签齐备」。
+  现在：用对端公钥（`_peer_sign_public`）对 `sig_object` 做真实 `verify_message`；验不过 → 不置双签。
+- **P0-3 第①轮 hash 裸传可被替换**：现在第①轮 hash 也带签名，接收方**先验签再采信**，未验签的 peer_hash 丢弃。
+- 新增 `ledger.verifier_from_pubkeys()`：一行构造「用双方公钥做真实验签」的 verifier。
+
+#### 信令鉴权
+- **P0-4 离线消息伪鉴权**：原 `Bearer <DID 字符串>` 即可拉走他人离线消息。
+  现在：`POST /signal/auth/challenge` 下发一次性 nonce，客户端用私钥签 `agentlink-auth-v1:`+body 构造 token；
+  `GET /signal/offline_msg/{did}` 验签 + 时效（TTL 120s）+ 一次性 nonce。
+- **P0-5 `/signal/audit` 裸奔**：现在本机（127.0.0.1）放行，非本机需 `X-Admin-Token` == env `AGENTLINK_ADMIN_TOKEN`。
+
+#### 频道 E2EE 诚实化
+- **P0-6 频道组密钥公开可算**：`derive_channel_key` 用公开参数派生，属假 E2EE。现废除（一律返回 None），
+  频道加密明确划归 **v0.5 路线**（pairwise X25519 / Megolm）。
+
+### 🟠 P1 修复（工程加固）
+
+- **P1-1 关键路径静默吞异常**：新增 `agentlink/logbook.py`（结构化日志，`AGENTLINK_LOG_LEVEL`/`AGENTLINK_LOG_FILE` 可控）；
+  把 node/signal/secure_session 里**关键路径**（解密/账本/审计/鉴权）的 `except: pass` 换成带上下文的日志
+  （保留「不阻断主链路」原则，但必须留痕）。
+- **P1-2 SQLite 在 async 共享**：`_conn()` 加 `timeout=5` + `check_same_thread=False` + **WAL 模式**；`p2.py` 加 `_db_lock` 串行化。
+- **P1-3 状态机裸字符串**：`AgentLinkNode` 引入 `NodeState` 枚举 + `_TRANSITIONS` 转换表 + `_set_state()`，
+  非法转换抛 `StateError`；`status` 保留字符串 property 兼容旧调用方。
+- **P1-4 handshake nonce 无赋值点**：WS 连接建立时服务端下发 `signal.challenge` 一次性 nonce，客户端须在其凭证中回传。
+- **P1-5 DID 凭证可重放**：`verify_did_binding()` 新增**时效窗口**（`DID_BINDING_MAX_AGE=300s`）与**挑战 nonce 校验**；
+  `sign_did_binding(kp, nonce)` 把 nonce 纳签名 payload。
+- **P1-7 无防重放**：`SessionCipher` 新增单调 `seq` 接收窗口（`_accept_seq`），**同 seq 重放 → 拒绝解密**；
+  窗口大小 256，超限自动清理旧记录。
+
+### ✅ 测试
+
+- P0：新增 11 项（账本 5 + 信令鉴权 6）。
+- P1：新增 9 项（状态机 3 + DID 时效/挑战 4 + 防重放 1 + 日志 1）。
+- **74 passed**（v0.3.0 为 54，零破坏）。
+
+### 🌐 仍需真机验证
+
+- P0-2/P0-3 改了 `ledger_sig` 两轮交换报文（第①轮增 `hash_sig`）→ **两端必须同步升 v0.3.1**。
+- P1-4/P1-5 改了 WS 认证握手（新增 `signal.challenge`）→ 客户端需升级以回传 nonce。
+- 以上均**未跑真机**，仅单测通过。
+
+### ⚠️ 诚实说明
+
+- 本版做 **P0 止血 + P1 工程加固**。**未解决**：对称棘轮非真棘轮（无 DH 棘轮/前向保密）、
+  82 处吞异常只改了关键路径（其余静默仍存）、DIY 密码学建议换 Noise/libsignal、
+  账本哈希链不防合谋截断、DID cert 仍是自签（无外部可信锚）。
+
 ## [v0.3.0] - 2026-10-12
 
 > 主题：**跨机账本一致性**——让双方签**同一个**签名对象。
@@ -48,11 +107,11 @@
 `websockets.connect(主机名)` 首试 IPv6 → 对端无监听 → **5s 超时**（httpx 有回退所以侥幸能连）。
 
 **修法**：新增 `agentlink/netutil.py` 的 `prefer_ipv4_url()`，在所有出站连接点把 host 解析为 IPv4：
-- `agentlink_call_peer.py` / `agentlink_responder_call.py`（替换 ad-hoc `_force_ipv4`）
+- `agentlink_call_zheng.py` / `agentlink_call_tiger.py`（替换 ad-hoc `_force_ipv4`）
 - `agentlink/node.py` `call()`（peer WS + HTTP 一并归一）
 - 逃生开关 `AL_PREFER_IPV6=1`（未来双栈环境）；`AL_NET_DEBUG=1` 打印解析
 
-**实测**：主机名连接 **5.0s 超时 → 0.028s**（快 ~178 倍）；发起方→响应方 与 响应方→发起方 **双向均通**。
+**实测**：主机名连接 **5.0s 超时 → 0.028s**（快 ~178 倍）；tiger→zheng 与 zheng→tiger **双向均通**。
 **新增测试**：`tests/test_netutil.py`（7 项）。**53 passed**（原 46）。
 
 ### 🔧 补：initiator 路径建账本（2026-10-12）

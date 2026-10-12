@@ -56,7 +56,12 @@ CHANNEL_DB_PATH = _os.path.join(
 # ═══════════════════════════════════════════════
 
 def init_channel_db(db_path: str = CHANNEL_DB_PATH):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:  # noqa: BLE001
+        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             id TEXT PRIMARY KEY,
@@ -113,6 +118,9 @@ class ChannelRelay:
                  signal_server: Optional[SignalServer] = None):
         self.db_path = db_path
         self.conn = init_channel_db(db_path)
+        # P1-2：单连接被多协程共享会有竞态/锁问题 —— 加一道锁串行化写操作
+        import threading as _threading
+        self._db_lock = _threading.RLock()
         # WS 连接池: ws_id → {websocket, agent_did, channels}
         self.ws_pool: dict[str, dict] = {}
         # 频道→订阅者映射 (内存加速)
@@ -392,30 +400,14 @@ class ChannelRelay:
 
     def derive_channel_key(self, channel_id: str) -> bytes:
         """
-        从频道创建者密钥派生组密钥。
-        仅当 creator 提供了 e2ee 参数且成员完备时才生成真实密钥；
-        否则返回 None（调用方应拒绝加密或回退到成员间 DH）。
+        [P0-6 已废除] 原实现的频道「组密钥」是**公开可算**的：
+        密钥 = HKDF(channel_id(公开) + owner 公开公钥)，任何人知道频道 ID 即可算出，
+        服务端也能解。这是**假 E2EE**（名不副实），已于 v0.3.1 废除。
+
+        真正的频道加密属于 **v0.5 路线**（pairwise X25519 / Megolm 组密钥）。
+        在此之前本函数一律返回 None，调用方**必须拒绝**任何「频道加密」对外承诺。
         """
-        channel = self.get_channel(channel_id)
-        if not channel or not channel.get("e2ee"):
-            return None  # 频道未启用 E2EE，不生成假密钥
-        owner_did = channel.get("owner")
-        owner_key = channel.get("owner_enc_public_b64")
-        if not owner_key:
-            # 尝试从成员列表查找 owner 公钥
-            members = self.get_members(channel_id)
-            for m in members:
-                if m["did"] == owner_did:
-                    owner_key = m.get("enc_public_b64")
-                    break
-        if not owner_key:
-            return None
-        # 派生方式：channel_id + owner_pubkey → HKDF，不是纯常量
-        return derive_session_key(
-            hashlib.sha256(
-                f"agentlink:channel:{channel_id}".encode() + _unb64(owner_key)
-            ).digest()
-        )[0]
+        return None
 
     def get_channel_cipher(self, channel_id: str, my_did: str, peer_did: str) -> SessionCipher:
         """获取两个频道成员之间的加密器"""

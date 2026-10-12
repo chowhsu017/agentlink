@@ -89,9 +89,13 @@ def cmd_ledger(args):
         sys.exit(1)
 
     if args.action == "verify":
-        # 注意：CLI 无对方的公钥，只能校「哈希链 + 双签齐备」；真实验签需调用方提供公钥
-        r = led.verify(verifier=None)
+        # P0-1：CLI 默认只校「哈希链 + 双签齐备」，不验签；如需真实验签需提供公钥
+        #   · 默认 allow_unverified=False → 未传 verifier 时不判通过（防伪造双签蒙混）
+        #   · 真实验签：led.verifier_from_pubkeys(pub_i, pub_r)
+        r = led.verify(verifier=None, allow_unverified=getattr(args, "allow_unverified", False))
         print(json.dumps(r, ensure_ascii=False, indent=2))
+        if r.get("sig_verified") is None and r.get("ok"):
+            print("⚠️ 注意：本次仅校验哈希链+双签齐备，**未做真实签名验证**。")
         sys.exit(0 if r["ok"] else 1)
 
     # show：人类可读 + 内联哈希链校验
@@ -113,9 +117,9 @@ def cmd_ledger(args):
         enc = e.detail.get("enc", "")
         print(f"[{e.seq:>3}] {e.ts}  {e.type:<18} enc={enc}{flag}")
     print("-" * 70)
-    r = led.verify(verifier=None)
-    print(f"完整性: {'✅ 通过' if r['ok'] else '❌ ' + r['reason']}")
-    print(f"（提示：真实签名验证需调用方提供双方公钥；CLI 只能校哈希链+双签齐备）")
+    r = led.verify(verifier=None, allow_unverified=True)
+    print(f"完整性: {'✅ 哈希链+双签齐备' if r['ok'] else '❌ ' + r['reason']}")
+    print("（提示：以上为「哈希链+双签齐备」校验；真实签名验证需调用方提供双方公钥，见 ledger.verifier_from_pubkeys）")
 
 
 def cmd_keygen(args):
@@ -308,6 +312,8 @@ def main():
                        help="show=查一本账本，list=列出已有账本，verify=双签校验")
     p_led.add_argument("session_id", nargs="?", help="账本 session_id（show/verify 必填）")
     p_led.add_argument("--dir", help="账本目录（默认 ~/.agentlink/ledgers）")
+    p_led.add_argument("--allow-unverified", action="store_true",
+                       help="verify 时允许「仅校哈希链+双签齐备、不做真实验签」（默认拒绝）")
     p_led.set_defaults(func=cmd_ledger)
 
     # help

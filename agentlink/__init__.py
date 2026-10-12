@@ -66,7 +66,7 @@ __all__ = [
     "SignalClient",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __protocol__ = "agentlink.session.v1"
 
 # P2 — 频道中继 + Presence 联邦

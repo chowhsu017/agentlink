@@ -146,7 +146,7 @@ class SessionLedger:
     responder: str               # responder DID
     channel: str = "ws"
     started_at: str = field(default_factory=_now_iso)
-    peer_name: str = ""          # 我方在本会话中的名字（node-a / node-b）
+    peer_name: str = ""          # 我方在本会话中的名字（tiger-mac / zheng-mac）
     ledger_dir: str = DEFAULT_LEDGER_DIR
 
     events: list = field(default_factory=list)
@@ -336,7 +336,7 @@ class SessionLedger:
 
     # ---- 双签校验（H1 核心 + v0.3 C1/C3）----
     def verify(self, *, verifier=None, require_peer_sig: bool = True,
-               is_initiator: bool = True) -> dict:
+               is_initiator: bool = True, allow_unverified: bool = False) -> dict:
         """
         校验规则：
           1. 重算哈希链，确认 events 未被删改
@@ -344,7 +344,10 @@ class SessionLedger:
           3. H1：检查**双方**签名齐备（缺对方签名 → invalid）
           4. v0.3 C1/C3：重算 sig_object' = sha256(θ(本端 hash, 对端 hash))
              并与记录的 sig_object 比对 —— 任一 hash 被改 → 对象变 → 暴露
-          5. 若提供 verifier(签名, sig_object, 角色) 回调 → 对 **sig_object** 实际验签
+          5. P0-1：**必须**提供 verifier(签名, sig_object, 角色) 回调做真实验签；
+             未提供时默认 **不通过**（ok=False），除非显式 allow_unverified=True。
+             v0.3.0 之前的 bug：verifier=None 时 sig_verified 保持 None 但 ok=True，
+             导致「填两个非空字符串就报通过」→ 可审计性归零。
 
         verifier 形如: verifier(sig_str, sig_object, role) -> bool
         返回 dict(ok, hash_chain_ok, ledger_hash_ok, both_sigs_present,
@@ -399,8 +402,18 @@ class SessionLedger:
         else:
             # 无私 hash（单签场景）—— sig_object 无法跨机校验，但不阻断本地链校验
             out["sig_object_ok"] = None
-        # 5) 实际验签：对象 = sig_object
-        if verifier is not None and out["both_sigs_present"]:
+        # 5) 实际验签：对象 = sig_object（P0-1：必须真实验签，否则不判通过）
+        if out["both_sigs_present"]:
+            if verifier is None:
+                if allow_unverified:
+                    # 显式声明「只校链不验签」：ok 可过，但显式标注未验签，避免误读为已验真
+                    out["sig_verified"] = None
+                    out["reason"] = "unverified: no verifier supplied (hash-chain + dual-sig presence only)"
+                    out["ok"] = True
+                    return out
+                out["reason"] = ("verifier required: 未提供验签器，双签真伪无法确认"
+                                 "（如需仅校哈希链，显式传 allow_unverified=True）")
+                return out
             target = self.sig_object or self.ledger_hash
             try:
                 vi = verifier(self.signatures["initiator"], target, "initiator")
@@ -414,6 +427,34 @@ class SessionLedger:
                 return out
         out["ok"] = True
         return out
+
+    # ---- 便捷：用公钥字节做真实 Ed25519 验签 ----
+    def verifier_from_pubkeys(self, initiator_sign_pub: bytes,
+                              responder_sign_pub: bytes, *, prefix: bytes = b"") -> callable:
+        """
+        构造一个对 **sig_object** 做真实 Ed25519 验签的 verifier 回调。
+
+        用法（CLI / 独立校验）：
+            ver = led.verifier_from_pubkeys(pub_i, pub_r)
+            r = led.verify(verifier=ver)
+        """
+        from .crypto import verify_message
+
+        def _v(sig_str: str, sig_object: str, role: str) -> bool:
+            pub = initiator_sign_pub if role == "initiator" else responder_sign_pub
+            if not pub:
+                return False
+            try:
+                sig = bytes.fromhex(sig_str)
+            except (ValueError, TypeError):
+                try:
+                    from .crypto import _unb64
+                    sig = _unb64(sig_str)
+                except Exception:  # noqa: BLE001
+                    return False
+            return verify_message(pub, (prefix + sig_object.encode("utf-8")), sig)
+
+        return _v
 
     # ---- 只读加载 ----
     @staticmethod
@@ -468,8 +509,8 @@ if __name__ == "__main__":
     # 模拟双方各建一本账本（同一会话，视角不同）
     def build(is_init: bool):
         L = SessionLedger(sid,
-                          "did:agentlink:node-a:AAA" if is_init else "did:agentlink:node-b:BBB",
-                          "did:agentlink:node-b:BBB" if is_init else "did:agentlink:node-a:AAA")
+                          "did:agentlink:tiger-mac:AAA" if is_init else "did:agentlink:zheng-mac:BBB",
+                          "did:agentlink:zheng-mac:BBB" if is_init else "did:agentlink:tiger-mac:AAA")
         L._is_initiator_view = is_init
         L.record_handshake(kex="X25519", cipher="ChaCha20-Poly1305", sig="Ed25519",
                            did_verified=True, nonce="b3f2", peer_fpr="sha256:9a1c")
@@ -514,3 +555,8 @@ if __name__ == "__main__":
     A.peer_hash = H_B
     A.signatures.pop("responder")
     print("verify(missing peer) =", A.verify())
+
+    # P0-1：不给 verifier 时不得判通过
+    print("P0-1 verify(verifier=None) ok ?", A.verify(verifier=None)["ok"],
+          "<- 必须 False")
+    print("P0-1 verify(allow_unverified=True) =", A.verify(allow_unverified=True))

@@ -29,6 +29,7 @@ class SignalClient:
         self._http = httpx.AsyncClient(timeout=10)
         self._incoming_handler: Optional[Callable] = None
         self._connected = False
+        self._pending_first: Optional[dict] = None   # 兼容旧服务端：非 challenge 的首条消息
 
     # ─── HTTP API ───
 
@@ -127,8 +128,23 @@ class SignalClient:
             self._ws = await websockets.connect(f"{self.signal_ws}/signal/ws")
             self._connected = True
 
-            # 认证
-            auth = self.secure.get_auth_payload()
+            # P1-4/P1-5：服务端连接后先下发一次性挑战 nonce（signal.challenge）。
+            # 客户端必须收到它，并用它重签 cert（nonce 入签名），否则认证失败。
+            challenge_nonce = ""
+            try:
+                first = json.loads(await asyncio.wait_for(self._ws.recv(), timeout=3.0))
+                if first.get("method") == "signal.challenge":
+                    challenge_nonce = first.get("params", {}).get("nonce", "")
+                else:
+                    # 兼容旧服务端（不先发 challenge）——回退，把这条消息留待后续处理
+                    self._pending_first = first
+            except asyncio.TimeoutError:
+                pass  # 旧服务端不发 challenge，用无 nonce 的 cert
+            except Exception:
+                pass
+
+            # 认证（cert 现签，并把挑战 nonce 纳入签名）
+            auth = self.secure.get_auth_payload(nonce=challenge_nonce)
             await self._ws.send(json.dumps({
                 "method": "signal.auth",
                 "params": {
