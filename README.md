@@ -1,13 +1,15 @@
 # AgentLink — Agent-to-Agent 实时通信协议
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Protocol: AgentLink](https://img.shields.io/badge/Protocol-AgentLink-blue.svg)]()
+[![tests](https://github.com/chowhsu017/agentlink/actions/workflows/tests.yml/badge.svg)](https://github.com/chowhsu017/agentlink/actions/workflows/tests.yml)
 
 > **不是聊天工具，是 agent 之间的通信底座。**  
 > 七个原语搞定完整会话生命周期：呼叫 → 振铃 → 接受 → 数据帧 → 心跳 → 频道 → 挂断。  
 > 端到端加密、去中心化身份（DID）、信令发现、离线缓存，全都有。
 
-**版本**: 0.3.0 · **MIT 许可证**  
-**跨平台**: macOS / Linux / Windows — 纯 Python，到哪都能跑
+**版本**: 0.3.1 · **MIT 许可证**  
+**跨平台**: macOS / Linux / Windows — 纯 Python，到哪都能跑  
+**CI**: GitHub Actions 跑 Py3.10/3.11/3.12 矩阵 + 不变量断言（见徽章）
 
 ---
 
